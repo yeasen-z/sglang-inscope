@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InScope probe manifest",
+  "type": "object",
+  "required": ["hypothesis_id", "suffix_id", "model_id", "layer_ids", "feature_source", "split"],
+  "properties": {
+    "hypothesis_id": {"type": "string", "minLength": 1},
+    "suffix_id": {"type": "string", "minLength": 1},
+    "model_id": {"type": "string", "minLength": 1},
+    "model_revision": {"type": "string"},
+    "tokenizer_revision": {"type": "string"},
+    "layer_ids": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+    "feature_source": {"type": "string", "enum": ["hidden_layer", "suffix_logprob", "hidden_layer_and_suffix_logprob"]},
+    "split": {"type": "object", "required": ["train", "validation", "test"], "properties": {"train": {"type": "string"}, "validation": {"type": "string"}, "test": {"type": "string"}}, "additionalProperties": false},
+    "seed": {"type": "integer"},
+    "probe_type": {"type": "string", "const": "binary_mlp"},
+    "threshold_source": {"type": "string", "const": "validation"},
+    "metadata": {"type": "object"}
+  },
+  "additionalProperties": false
+}

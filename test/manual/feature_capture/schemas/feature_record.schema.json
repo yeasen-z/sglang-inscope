@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InScope hidden feature record",
+  "type": "object",
+  "required": [
+    "id", "label", "hypothesis_id", "position_mode", "layer_ids",
+    "representation", "dtype", "shape", "data_path"
+  ],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "label": {"type": "integer", "enum": [0, 1]},
+    "hypothesis_id": {"type": "string", "minLength": 1},
+    "position_mode": {"type": "string", "enum": ["explicit", "suffix_last"]},
+    "suffix_id": {"type": "string", "minLength": 1},
+    "suffix": {"type": "string", "minLength": 1},
+    "model_id": {"type": "string", "minLength": 1},
+    "model_revision": {"type": "string"},
+    "tokenizer_revision": {"type": "string"},
+    "input_token_ids_sha256": {"type": "string"},
+    "suffix_token_ids": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+    "suffix_start": {"type": "integer", "minimum": 0},
+    "suffix_end": {"type": "integer", "exclusiveMinimum": 0},
+    "target_token_positions": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": -1}},
+    "position_specs": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+    "layer_ids": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+    "representation": {"type": "string", "const": "block_output"},
+    "dtype": {"type": "string", "enum": ["bfloat16", "float16", "float32"]},
+    "shape": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer", "minimum": 1}},
+    "data_path": {"type": "string", "minLength": 1},
+    "data_sha256": {"type": "string"},
+    "capture_mode": {"type": "string", "const": "prefill_only"},
+    "cache_mode": {"type": "string"},
+    "metadata": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"position_mode": {"const": "suffix_last"}}},
+      "then": {"required": ["suffix_id", "suffix", "suffix_token_ids", "suffix_start", "suffix_end", "position_specs"]}
+    },
+    {
+      "if": {"properties": {"position_mode": {"const": "explicit"}}},
+      "then": {"required": ["target_token_positions", "position_specs"]}
+    }
+  ],
+
+  "additionalProperties": false
+}
