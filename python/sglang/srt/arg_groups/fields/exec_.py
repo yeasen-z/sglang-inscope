@@ -38,6 +38,15 @@ class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
+    feature_capture_graph_layers: A[
+        Optional[List[int]],
+        Arg(
+            help="Native feature boundary layers captured by dedicated prefill CUDA graphs. "
+            "Requires SGLANG_ENABLE_FEATURE_CAPTURE=1 and breakable/full prefill graphs. "
+            "Positions remain request-scoped; requests outside these layers use eager execution.",
+            nargs="+",
+        ),
+    ] = None
     enable_fp32_lm_head: A[
         bool,
         "If set, the LM head outputs (logits) are in FP32.",

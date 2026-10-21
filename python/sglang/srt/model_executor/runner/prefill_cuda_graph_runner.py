@@ -54,6 +54,8 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.feature_capture.graph import GraphFeatureCaptureRecorder
+from sglang.srt.feature_capture.spec import validate as validate_feature_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
@@ -350,6 +352,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- prefill graph config -------------------------------------
         prefill_config = get_exec().graph.cuda_graph_config.prefill
         self.prefill_backend_name = prefill_config.backend
+        graph_layers = get_exec().features.feature_capture_graph_layers
+        self.feature_graph_layers = ()
+        self.feature_graph_recorders: dict[int, GraphFeatureCaptureRecorder] = {}
+        if graph_layers:
+            if self.prefill_backend_name not in (Backend.BREAKABLE, Backend.FULL):
+                raise ValueError(
+                    "feature capture graphs require breakable/full prefill backend"
+                )
+            graph_spec = validate_feature_capture(
+                {"layers": graph_layers, "positions": {"mode": "last"}},
+                num_layers=model_runner.model_config.num_hidden_layers,
+                hidden_size=model_runner.model_config.hidden_size,
+                prompt_ids=[0],
+            )
+            self.feature_graph_layers = graph_spec.layers
         qwen_bcg = self.prefill_backend_name == Backend.BREAKABLE and is_qwen4_exp(
             model_runner.model_config.hf_config
         )
@@ -1406,6 +1423,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        # Normal graphs have no feature hooks. Opt-in feature graphs are dedicated
+        # to prefill-only capture; ordinary/generating requests retain the eager path.
+        if forward_batch.feature_capture_requested:
+            if not self.feature_graph_layers or not forward_batch.is_prefill_only:
+                return False
+            if any(
+                slot.layer not in self.feature_graph_layers
+                for slot in forward_batch.feature_capture_plan
+            ):
+                return False
+        elif self.feature_graph_layers:
+            return False
         # DP check: group verdict from the schedule-time all-gather
         # (min-reduced votes; also requires every rank to hold tokens).
         if (
@@ -1662,6 +1691,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     req_lens=shape_inputs["extend_seq_lens"],
                 )
             forward_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
+            if self.feature_graph_layers:
+                recorder = self.feature_graph_recorders.get(num_tokens)
+                if recorder is None:
+                    recorder = GraphFeatureCaptureRecorder(
+                        layers=self.feature_graph_layers,
+                        capacity=num_tokens,
+                        device=self.device,
+                    )
+                    self.feature_graph_recorders[num_tokens] = recorder
+                forward_batch.feature_capture_requested = True
+                forward_batch.is_prefill_only = True
+                forward_batch.feature_capture_recorder = recorder
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
@@ -1981,6 +2022,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 else False
             ),
             is_prefill_only=forward_batch.is_prefill_only,
+            feature_capture_requested=forward_batch.feature_capture_requested,
+            feature_capture_plan=forward_batch.feature_capture_plan,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,
@@ -2325,6 +2368,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch, **kwargs
             )
             static_num_tokens = len(static_forward_batch.input_ids)
+            if self.feature_graph_layers:
+                recorder = self.feature_graph_recorders[static_num_tokens]
+                recorder.prepare(forward_batch.feature_capture_plan)
+                static_forward_batch.feature_capture_recorder = recorder
+                # ModelRunner's native output attachment owns the compact result.
+                forward_batch.feature_capture_recorder = recorder
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
             # The only variants this runner records are chunked-prefix ones.

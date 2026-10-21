@@ -133,7 +133,7 @@ curl http://127.0.0.1:30000/generate \
 - Qwen3.5 顶层 checkpoint 需用 `language_model_only=True`；v1 不接受视觉输入。
 - 已验证配置为 CUDA、TP=1、PP=1；DP attention、CP、TBO、speculative decoding、
   disaggregation、multimodal 和 split prefill 会 fail fast。
-- capture 请求不走 CUDA graph；chunked prefill 和 radix cache 已有真实 GPU 验证。
+- 默认 capture 请求走 eager；显式配置 `feature_capture_graph_layers` 可使用专用 prefill CUDA graph，见下节。chunked prefill 和 radix cache 保留原生请求语义。
 - 当前交付面是 Python `Engine.generate()` 和原生 `/generate`；不包含 OpenAI
   `/v1/chat/completions` 或 `/v1/completions` 的 features 字段。
 
@@ -209,3 +209,45 @@ SGLANG_CACHE_DIR=/tmp/sglang-inscope-cache \
 探测 AUROC 高只说明表示里存在**可利用的信号**，
 不等于模型「理解」了该属性，也不证明生成时真的使用了它。
 任何结论文档必须保留这条边界。
+
+## 专用 feature-only prefill
+
+`max_new_tokens=0` 的纯特征请求跳过 vocabulary projection；请求 logprob、
+scoring、grammar 或 hidden-state 输出时保留原有 logits 路径。所有 decoder
+层仍正常执行，层边界定义不变。
+
+启用专用图时，在 `SGLANG_ENABLE_FEATURE_CAPTURE=1` 下创建 Engine：
+
+```python
+engine = sglang.Engine(
+    model_path=model_path,
+    feature_capture_graph_layers=[8, 16, 24],
+    cuda_graph_config={
+        "decode": {"backend": "disabled"},
+        "prefill": {"backend": "breakable", "bs": [64, 128, 256], "max_bs": 256},
+    },
+)
+```
+
+仅层集合固定；位置、RID 和编码仍取自每次请求的原生 `feature_capture`。
+静态索引在 replay 前更新，返回张量在 replay 后复制到独立的紧凑缓冲，
+不暴露 padding 或下一次 replay 可覆盖的存储。支持 breakable/full backend；
+普通请求、生成请求及层集合之外的请求走 eager。默认服务不配置这些图层时，
+普通请求保留原有 graph 路径，不分配特征缓冲。
+
+Qwen3 FA3/FA4 还可使用已有 `prefill_only_disable_kv_cache=True`，同时设置
+`disable_radix_cache=True, chunked_prefill_size=-1`。生成模型的此模式要求开启
+原生 feature capture，只接受显式 `feature_capture`、`max_new_tokens=0`。
+现有 embedding 模式及 dtype/pool/backend 限制不变；不支持 hybrid/Mamba。
+专用 no-KV HTTP 服务应跳过通用生成 warmup，并使用不生成 token 的健康检查。
+
+输入长度仍严格校验；输出预算由 scheduler 截至剩余上下文，输入不截断。
+
+CPU 回归位于 `test/registered/unit/feature_capture/`；独立 CUDA 索引重放与
+输出所有权检查：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test/manual/feature_capture/test_graph_recorder_cuda.py
+```
+
+完整模型数值验证仍需运行手工验收。上述小型 CUDA 检查不代替模型验收。

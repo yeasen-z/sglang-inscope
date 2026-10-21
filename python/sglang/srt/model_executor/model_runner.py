@@ -76,12 +76,12 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.feature_capture.recorder import attach_feature_output
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.feature_capture.recorder import attach_feature_output
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_active,
@@ -1272,6 +1272,20 @@ class ModelRunner:
             validate_capabilities,
         )
 
+        if get_exec().features.feature_capture_graph_layers:
+            if not is_enabled():
+                raise ValueError(
+                    "feature_capture_graph_layers requires SGLANG_ENABLE_FEATURE_CAPTURE=1"
+                )
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            if get_exec().graph.cuda_graph_config.prefill.backend not in (
+                Backend.BREAKABLE,
+                Backend.FULL,
+            ):
+                raise ValueError(
+                    "feature capture graphs require breakable/full prefill backend"
+                )
         if not is_enabled():
             return
         parallel = get_parallel()
@@ -2063,7 +2077,6 @@ class ModelRunner:
                 )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
-                and not forward_batch.feature_capture_plan
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)

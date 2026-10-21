@@ -872,15 +872,13 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
     if not cfg.prefill_only_disable_kv_cache:
         return
 
-    # This flag is intentionally scoped to embedding mode for now. Other
-    # prefill-only paths (for example scoring and MIS) can benefit from
-    # the same idea later, but some of them still stage K/V through the
-    # paged cache today.
-    if not cfg.is_embedding:
+    # For generation models this explicit opt-in creates a dedicated native
+    # feature-only service. The tokenizer rejects every request that could
+    # need KV reuse; embedding workloads retain their existing behavior.
+    if not cfg.is_embedding and not envs.SGLANG_ENABLE_FEATURE_CAPTURE.get():
         raise ValueError(
-            "--prefill-only-disable-kv-cache currently requires --is-embedding. "
-            "Other prefill-only workloads may be supported in a future change once "
-            "their attention paths stop reading or writing the paged KV cache."
+            "--prefill-only-disable-kv-cache requires --is-embedding or "
+            "SGLANG_ENABLE_FEATURE_CAPTURE=1 for a dedicated feature-only service."
         )
     if cfg.kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         raise ValueError(

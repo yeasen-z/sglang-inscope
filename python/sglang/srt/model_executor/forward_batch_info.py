@@ -570,6 +570,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For logprob
     return_logprob: bool = False
     # Request-scoped feature rows selected for this extend forward.
+    # Independent of the current chunk: selected positions may belong to a later chunk.
+    feature_capture_requested: bool = False
     feature_capture_plan: Tuple[SlotPlan, ...] = ()
     feature_capture_recorder: Optional[FeatureCaptureRecorder] = None
     # Whether this batch is prefill-only (no token generation needed)
@@ -999,9 +1001,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             specs=[req.feature_capture for req in batch.reqs],
             extend_lens=extend_seq_lens,
             seq_lens=(
-                batch.seq_lens_cpu.tolist()
-                if batch.seq_lens_cpu is not None
-                else ()
+                batch.seq_lens_cpu.tolist() if batch.seq_lens_cpu is not None else ()
             ),
             prefix_lens=extend_prefix_lens,
         )
@@ -1083,6 +1083,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             replace_positions=batch.replace_positions,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
+            feature_capture_requested=any(
+                req.feature_capture is not None for req in batch.reqs
+            ),
             feature_capture_plan=feature_capture_plan,
             feature_capture_recorder=feature_capture_recorder,
             is_extend_in_batch=batch.is_extend_in_batch,

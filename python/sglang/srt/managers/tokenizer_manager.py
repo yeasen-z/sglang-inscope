@@ -74,8 +74,8 @@ from sglang.srt.feature_capture.capabilities import (
 )
 from sglang.srt.feature_capture.spec import (
     FeatureRequestSpec,
-    validate as validate_feature_capture,
 )
+from sglang.srt.feature_capture.spec import validate as validate_feature_capture
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -609,7 +609,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.default_priority_value = get_schedule().default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens()
-        self.validate_total_tokens = True
+        # The scheduler caps output to the remaining context/memory budget.
+        # Keep the full prompt and retain strict input-length validation.
+        self.validate_total_tokens = False
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
@@ -1330,6 +1332,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        # Check raw sampling parameters before default normalization: omitted
+        # max_new_tokens must not turn into generation on a no-KV service.
+        if self.is_generation and get_schedule().prefill_only_disable_kv_cache:
+            if not isinstance(obj, GenerateReqInput) or obj.feature_capture is None:
+                raise ValueError(
+                    "A no-KV feature-only service requires feature_capture on every request."
+                )
+            if obj.sampling_params.get("max_new_tokens") != 0:
+                raise ValueError(
+                    "A no-KV feature-only service requires explicit max_new_tokens=0."
+                )
+
         # FIXME: unify the length validation logic with the one in the scheduler.
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if obj.image_data is not None and not get_platform().is_cuda:
@@ -1691,9 +1705,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if obj.feature_capture is None:
             return None
         if not feature_capture_enabled():
-            raise ValueError(
-                "feature_capture requires SGLANG_ENABLE_FEATURE_CAPTURE=1"
-            )
+            raise ValueError("feature_capture requires SGLANG_ENABLE_FEATURE_CAPTURE=1")
         if mm_inputs is not None or obj.contains_mm_input():
             raise ValueError("feature_capture v1 supports text-only requests")
         if obj.session_id is not None or obj.session_params is not None:
