@@ -333,6 +333,10 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+
+    # Opt-in gate for request-scoped hidden-feature capture. Unsupported
+    # runtime combinations fail during model-runner initialization.
+    SGLANG_ENABLE_FEATURE_CAPTURE = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is

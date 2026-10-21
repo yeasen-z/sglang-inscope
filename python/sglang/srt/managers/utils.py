@@ -229,10 +229,16 @@ class GenerationBatchResult:
     def copy_auxiliary_output_to_cpu(self) -> None:
         if self.logits_output is None or self.auxiliary_host_output is not None:
             return
-        device_output = self.logits_output.auxiliary_device_output
+        from sglang.srt.managers.auxiliary_output import append_auxiliary_output
+
+        device_output = append_auxiliary_output(
+            self.logits_output.auxiliary_device_output,
+            self.logits_output.feature_device_output,
+        )
         if device_output is not None:
             self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
             self.logits_output.auxiliary_device_output = None
+            self.logits_output.feature_device_output = None
 
     @classmethod
     def from_pp_proxy(

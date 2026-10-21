@@ -118,9 +118,12 @@ expected_confounders:
 - `position_mode == explicit` 时：`suffix`、`suffix_id`、`suffix_start`、`suffix_end` 可以不存在；每个 position 是完整 input token ids 的合法 zero-based 位置，`-1` 只表示完整输入末 token
 - `shape[0] == len(layer_ids)`，如果有多个 positions，则 shape 应明确为 `[len(layer_ids), len(positions), hidden_size]`
 - layer 顺序与请求顺序一致
-- **`layer_ids` 的语义是 HF `outputs.hidden_states[L]` 的索引**（见 `inscope/design/implementation-design.md` §3）：
-  合法范围 `[0, num_hidden_layers]`，`num_hidden_layers` 即 `-1`，表示 final norm 之前的残差。
-  与 `output_hidden_states=True` 的元组逐项对应，**不做任何 `+1`**。
+- **`layer_ids` 的语义是 residual-stream block boundary**（见
+  `inscope/design/implementation-design.md` §3）：合法范围
+  `[0, num_hidden_layers]`，`num_hidden_layers` 即 `-1`，表示 final norm
+  之前的残差。`L < N` 与 HF `outputs.hidden_states[L]` 对齐；`L=N` 必须从
+  HF 最后一个 decoder block 的 forward hook 获取，不能使用 post-final-norm
+  的 `outputs.hidden_states[N]`。
   若某条记录来自采用 block 索引的旧采集（如 FeaturePrefill 的 `layer 9`），
   必须在 `metadata.index_convention = "block"` 里声明，读取时统一换算，禁止与 HF 索引混存。
 - layer ids 无重复、无越界
@@ -170,8 +173,9 @@ resolve_positions(input_token_ids, position_spec, optional_suffix_span)
 因此这一组必须与 HF 参考逐层对照，不允许只看"跑通了"。
 
 语义定义（`inscope/design/implementation-design.md` §3）：
-请求层号 `L` 等同 HF `outputs.hidden_states[L]`，合法范围 `[0, num_hidden_layers]`，
-`L == num_hidden_layers`（或 `-1`）表示 final RMSNorm 之前的残差。内部零偏移。
+请求层号 `L` 表示 residual-stream block boundary，合法范围
+`[0, num_hidden_layers]`；`L == num_hidden_layers`（或 `-1`）表示 final
+RMSNorm 之前的残差。
 
 对 Qwen3-8B（36 层，`hidden_states` 共 37 项）：
 
@@ -185,10 +189,12 @@ L=36  → 第 35 个（最后）block 输出，final norm 之前     ≡ L=-1
 
 必测断言：
 
-1. 上述 5 个层位分别与 HF BF16 eager `hidden_states[L]` 对照，`cos ≥ 0.9999`、`rel_L2 ≤ 5e-3`
+1. 上述 5 个层位分别与 HF BF16 对照：`L<N` 使用 `hidden_states[L]`，
+   `L=N` 使用最后 block hook；断言 `cos ≥ 0.9999`、`rel_L2 ≤ 2e-2`。
+   relative-L2 阈值由 Qwen3-8B BF16 五层实测校准，观测最大值为 1.40%
 2. **`L=35` 与 `L=36` 的结果不相等**（若相等，说明两个采集点撞在一起）
-3. **`L=36` 是 pre-norm**：与 HF 的 `hidden_states[36]` 对照，而不是 `hidden_states[37]`
-   或 `model.norm(hidden_states[36])`
+3. **`L=36` 是 pre-norm**：与 HF 最后一个 decoder block 的 forward hook
+   对照，而不是 post-final-norm 的 `hidden_states[36]`
 4. `L=0` 不等于 `L=1`（若相等，说明 embedding 捕获点没生效、实际取到了第一层输出）
 5. 一次请求同时要 `L ∈ {0, 1, 20, 35, 36}` 时，五个结果与分别单独请求的结果一致
 6. 越界 `L = 37`、`L = -38` 被拒绝

@@ -26,6 +26,7 @@ class EngineBase(ABC):
         return_hidden_states: Optional[
             Union[bool, Literal["last"], List[Union[bool, Literal["last"]]]]
         ] = None,
+        feature_capture: Optional[Union[Dict, List[Optional[Dict]]]] = None,
         stream: Optional[bool] = None,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,

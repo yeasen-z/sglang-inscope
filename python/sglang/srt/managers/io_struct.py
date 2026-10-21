@@ -52,6 +52,7 @@ from pydantic import PlainValidator
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
+from sglang.srt.feature_capture.spec import FeatureRequestSpec
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
@@ -260,6 +261,11 @@ class GenerateReqInput:
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
     ] = False
+    # Request-scoped hidden-feature capture contract. For batched requests this
+    # can be one shared mapping or one optional mapping per request.
+    feature_capture: Optional[
+        Union[Dict[str, Any], List[Optional[Dict[str, Any]]]]
+    ] = None
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -572,6 +578,10 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if self.feature_capture is not None and not isinstance(
+            self.feature_capture, dict
+        ):
+            raise ValueError("feature_capture should be a mapping for one request.")
         for field_name in ("extra_key", "cache_salt"):
             value = getattr(self, field_name)
             if value is not None and not isinstance(value, str):
@@ -607,6 +617,7 @@ class GenerateReqInput:
         self._normalize_watermark(num)
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
+        self._normalize_feature_capture(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
@@ -836,6 +847,30 @@ class GenerateReqInput:
             get_return_hidden_states_mode(self.return_hidden_states)
             self.return_hidden_states = [self.return_hidden_states] * num
 
+    def _normalize_feature_capture(self, num):
+        """Normalize raw capture mappings without resolving token positions."""
+        if self.feature_capture is None:
+            self.feature_capture = [None] * num
+        elif isinstance(self.feature_capture, dict):
+            self.feature_capture = [
+                copy.deepcopy(self.feature_capture) for _ in range(num)
+            ]
+        elif isinstance(self.feature_capture, list):
+            if len(self.feature_capture) != self.batch_size:
+                raise ValueError(
+                    "The length of feature_capture should equal the batch size."
+                )
+            if any(
+                value is not None and not isinstance(value, dict)
+                for value in self.feature_capture
+            ):
+                raise ValueError(
+                    "Every feature_capture item should be a mapping or None."
+                )
+            self.feature_capture = self.feature_capture * self.parallel_sample_num
+        else:
+            raise ValueError("feature_capture should be a mapping or a list.")
+
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
         if self.custom_logit_processor is None:
@@ -998,6 +1033,11 @@ class GenerateReqInput:
                 if isinstance(self.return_hidden_states, list)
                 else self.return_hidden_states
             ),
+            feature_capture=(
+                self.feature_capture[i]
+                if isinstance(self.feature_capture, list)
+                else self.feature_capture
+            ),
             return_routed_experts=self.return_routed_experts,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
@@ -1092,6 +1132,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return hidden states
     return_hidden_states: ReturnHiddenStatesMode = False
+
+    # Validated after tokenization; positions are absolute prompt-token indices.
+    feature_capture: Optional[FeatureRequestSpec] = None
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False

@@ -18,17 +18,17 @@ the HTTP/tokenizer process can validate a request before any GPU work exists.
 
 Layer numbering
 ---------------
-A requested layer ``L`` is the index into the HuggingFace ``hidden_states``
-tuple returned by ``output_hidden_states=True``. For a model with ``N`` decoder
-layers that tuple has ``N + 1`` entries::
+A requested layer ``L`` names a residual-stream block boundary. For a model
+with ``N`` decoder layers::
 
-    hidden_states[0]      embedding output, before decoder layer 0
-    hidden_states[L]      output of decoder layer L-1 (1 <= L <= N-1)
-    hidden_states[N]      output of the last decoder layer, before final norm
+    L = 0                 embedding output, before decoder layer 0
+    1 <= L <= N - 1      output of decoder layer L-1
+    L = N                 output of the last decoder layer, before final norm
 
-``-1`` is accepted as an alias of ``N``. There is deliberately no off-by-one to
-apply anywhere: the internal capture site for ``L`` is the attention entry of
-layer ``L`` (see ``inscope/design/implementation-design.md`` §3).
+For ``L < N`` this equals Hugging Face ``outputs.hidden_states[L]``. Current
+Transformers Qwen3 places the post-final-norm tensor in
+``outputs.hidden_states[N]``, so the ``L = N`` pre-norm reference instead comes
+from a forward hook on the last decoder block. ``-1`` aliases ``N``.
 """
 
 from __future__ import annotations
@@ -147,7 +147,11 @@ def _resolve_suffix(
         raise FeatureCaptureError(
             "positions.suffix_token_ids must be a non-empty list of token ids"
         )
-    suffix = tuple(int(token) for token in suffix)
+    if any(type(token) is not int for token in suffix):
+        raise FeatureCaptureError(
+            "positions.suffix_token_ids must contain only integer token ids"
+        )
+    suffix = tuple(suffix)
     width = len(suffix)
     occurrences, last_end = 0, -1
     for start in range(0, len(prompt_ids) - width + 1):
@@ -179,8 +183,8 @@ def validate(
             ``{"layers": [-1], "positions": {"mode": "last"}}``.
         num_layers: decoder layer count ``N`` from the model config.
         hidden_size: model hidden width, used only for the byte budget.
-        prompt_ids: tokenized prompt; required for every mode except ``last``
-            being resolved later, and for ``suffix_last`` always.
+        prompt_ids: tokenized prompt. Required because validation resolves every
+            requested position to an absolute prompt index.
         suffix_token_ids: pre-tokenized prompt suffix, filling in
             ``positions.index`` when the caller passed text instead of ids.
         max_targets: upper bound on ``len(layers)``.
@@ -231,10 +235,13 @@ def validate(
             f"positions.mode must be one of {', '.join(POSITION_MODES)}"
         )
 
-    if prompt_ids is None and mode in ("explicit", "suffix_last", "all"):
+    if prompt_ids is None:
         raise FeatureCaptureError(
-            f"positions.mode {mode!r} needs the tokenized prompt, which is not available yet"
+            f"positions.mode {mode!r} needs the tokenized prompt, "
+            "which is not available yet"
         )
+    if not prompt_ids:
+        raise FeatureCaptureError("feature_capture requires a non-empty tokenized prompt")
 
     if mode == "last":
         _reject_unknown(position_spec, ("mode",), "positions")

@@ -138,6 +138,16 @@ class TestPositionModes(CustomTestCase):
         with self.assertRaises(FeatureCaptureError):
             _validate({"layers": [4], "positions": {"mode": "explicit", "index": []}})
 
+    def test_every_mode_requires_a_tokenized_prompt(self):
+        for mode in ("last", "explicit", "suffix_last", "all"):
+            raw = {"layers": [4], "positions": {"mode": mode}}
+            with self.subTest(mode=mode), self.assertRaises(FeatureCaptureError):
+                validate(raw, num_layers=NUM_LAYERS, hidden_size=HIDDEN)
+
+    def test_rejects_empty_prompt(self):
+        with self.assertRaises(FeatureCaptureError):
+            _validate({"layers": [4]}, prompt_ids=())
+
 
 class TestSuffixMode(CustomTestCase):
     """suffix_last is a validator, not an alias for last."""
@@ -204,6 +214,19 @@ class TestSuffixMode(CustomTestCase):
             _validate(
                 {"layers": [4], "positions": {"mode": "suffix_last", "suffix_token_ids": []}}
             )
+
+    def test_rejects_non_integer_suffix_token_ids(self):
+        for suffix in ([True], [1.5], ["1"]):
+            with self.subTest(suffix=suffix), self.assertRaises(FeatureCaptureError):
+                _validate(
+                    {
+                        "layers": [4],
+                        "positions": {
+                            "mode": "suffix_last",
+                            "suffix_token_ids": suffix,
+                        },
+                    }
+                )
 
 
 class TestContractRejection(CustomTestCase):

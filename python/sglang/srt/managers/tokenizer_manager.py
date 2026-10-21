@@ -69,6 +69,13 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.feature_capture.capabilities import (
+    is_enabled as feature_capture_enabled,
+)
+from sglang.srt.feature_capture.spec import (
+    FeatureRequestSpec,
+    validate as validate_feature_capture,
+)
 from sglang.srt.layers.joint_schema_head import (
     max_joint_prompt_tokens,
     parse_decision_layout,
@@ -1584,6 +1591,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            feature_capture = self._validate_feature_capture(obj, input_ids, mm_inputs)
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -1623,6 +1631,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
+                feature_capture=feature_capture,
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,
@@ -1675,6 +1684,40 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    def _validate_feature_capture(
+        self,
+        obj: GenerateReqInput,
+        input_ids: Optional[List[int]],
+        mm_inputs,
+    ) -> Optional[FeatureRequestSpec]:
+        if obj.feature_capture is None:
+            return None
+        if not feature_capture_enabled():
+            raise ValueError(
+                "feature_capture requires SGLANG_ENABLE_FEATURE_CAPTURE=1"
+            )
+        if mm_inputs is not None or obj.contains_mm_input():
+            raise ValueError("feature_capture v1 supports text-only requests")
+        if obj.session_id is not None or obj.session_params is not None:
+            raise ValueError("feature_capture v1 does not support session requests")
+        if input_ids is None:
+            raise ValueError("feature_capture requires tokenized input_ids")
+
+        suffix_token_ids = None
+        positions = obj.feature_capture.get("positions")
+        if isinstance(positions, dict) and positions.get("suffix_text") is not None:
+            suffix_token_ids = self.tokenizer.encode(
+                positions["suffix_text"], add_special_tokens=False
+            )
+
+        return validate_feature_capture(
+            obj.feature_capture,
+            num_layers=self.model_config.num_hidden_layers,
+            hidden_size=self.model_config.hidden_size,
+            prompt_ids=input_ids,
+            suffix_token_ids=suffix_token_ids,
+        )
 
     @staticmethod
     def _resolve_embed_overrides(

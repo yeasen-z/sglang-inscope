@@ -63,19 +63,103 @@ feature_capture/
 └── fixtures/                         # 极小、无敏感信息的 smoke 数据
 ```
 
-后续正式实现前，先完成 `DESIGN.md` 中的契约和 smoke test；不要直接写一份只适配 Qwen3-8B 的脚本。
+契约、smoke test 和真实模型验收已实现；后续扩展新模型时继续复用
+`DESIGN.md` 中的请求与数值对照契约，不要写模型专用的旁路。
+
+## 真实模型 smoke / 数值对照
+
+`test_qwen3_hidden_layer.py` 是当前 Qwen3 后端的手工验收入口。它默认关闭
+radix cache 和 chunked prefill，执行 prefill-only 请求，并检查 explicit 与
+suffix_last 两种位置选择返回相同向量：
+
+```bash
+INSCOPE_QWEN3_MODEL=/DATA/disk1/models/Qwen3-8B \
+  /opt/miniconda3/envs/inscope/bin/python \
+  test/manual/feature_capture/test_qwen3_hidden_layer.py --gpu 0
+```
+
+加入 `--compare-hf` 会在 SGLang Engine 关闭、显存释放后加载同一 checkpoint，
+对每个目标层报告 cosine similarity 和 relative L2，并应用 `DESIGN.md` 中的
+BF16 阈值（cosine ≥ 0.9999、relative L2 ≤ 2%）。FP8 可通过
+`--model "$INSCOPE_QWEN3_FP8_MODEL"` 运行 SGLang smoke，
+但不能把 FP8 输出当作 BF16 golden。运行前应先用 `nvidia-smi` 确认所选 GPU
+空闲，不要抢占或终止其他用户的进程。
+
+为了避免 GPU 被抢或 HF 阶段失败后重跑 SGLang，建议先原子保存 capture：
+
+```bash
+.../test_qwen3_hidden_layer.py --gpu 7 --sglang-only \
+  --save-captures /tmp/qwen3-8b-captures.pt --benchmark-iterations 20
+
+# 之后只运行 HF 对照；模型路径默认从 capture 文件恢复
+.../test_qwen3_hidden_layer.py --gpu 7 \
+  --hf-only /tmp/qwen3-8b-captures.pt
+```
+
+输出计时包括 Engine startup、explicit/suffix 请求；启用 benchmark 后另报告
+普通 prefill、单层 capture、全部目标层 capture 的 mean/P50/P95。
+
+FP8 的首次请求可能触发多轮 DeepGEMM kernel tuning，单轮可持续数分钟。脚本
+默认将 scheduler watchdog 放宽到 1200 秒，避免默认 300 秒在调优尚未完成时
+误判为 hang；稳定运行不应出现这段开销。
+
+只验证功能而不做 DeepGEMM 性能调优时，使用 Triton 后端：
+
+```bash
+.../test_qwen3_hidden_layer.py --gpu 7 --sglang-only \
+  --fp8-gemm-backend triton
+```
+
+P3 手工矩阵可分别启用：
+
+```bash
+# 乱序多层 × 多位置，并与逐位置请求对照
+.../test_qwen3_hidden_layer.py --fp8-gemm-backend triton \
+  --layers 36 0 20 1 35 --p3-multi-position
+
+# 无 capture / 单层 / 多层多位置的混合 batch
+.../test_qwen3_hidden_layer.py --fp8-gemm-backend triton \
+  --layers 36 0 20 1 35 --p3-mixed-batch
+
+# 84-token 输入按 16 token 分块，目标横跨多个 chunk
+.../test_qwen3_hidden_layer.py --fp8-gemm-backend triton \
+  --layers 36 0 20 1 35 --repeat-input 4 \
+  --chunked-prefill-size 16 --p3-multi-position
+
+# radix cache 冷/热请求逐元素一致；目标之前的 KV 仍可复用
+.../test_qwen3_hidden_layer.py --fp8-gemm-backend triton \
+  --layers 36 0 20 1 35 --enable-radix-cache --p3-radix-cache
+
+# 三个独立异步请求与各自串行基准对照
+.../test_qwen3_hidden_layer.py --fp8-gemm-backend triton \
+  --layers 36 0 20 1 35 --p3-concurrent
+
+# 普通生成回归，以及生成同时返回 prompt features
+.../test_qwen3_hidden_layer.py --fp8-gemm-backend triton \
+  --p3-ordinary-regression --p4-generate-features
+
+# Qwen3.5-9B Dense text tower（checkpoint 顶层含视觉塔）
+INSCOPE_QWEN3_MODEL=/DATA/disk1/models/Qwen3.5-9B \
+.../test_qwen3_hidden_layer.py --language-model-only \
+  --layers 32 0 16 1 31 --p3-multi-position --p4-generate-features
+```
+
+层号是 residual-stream block boundary：`L<N` 与 HF `hidden_states[L]` 对齐；
+`L=N` 是最后一个 decoder block 的 pre-final-norm 输出，HF 参考由最后 block
+forward hook 获取，不能直接使用 post-final-norm 的 `hidden_states[N]`。
 
 ## 当前范围
 
-首版测试固定：
+当前已验收范围：
 
-- 模型：Qwen3-8B BF16 和 Qwen3-8B-FP8
+- 模型：Qwen3-8B BF16、Qwen3-8B-FP8 和 Qwen3.5-9B Dense text tower
 - 文本输入；不测试视觉输入
 - TP=1、PP=1
-- prefill-only
-- 目标位置：完整拼接输入最后一个 token，即 suffix 最后一个 token
+- prefill-only 以及 generate + features
+- 目标位置：explicit、last、suffix_last 和多位置
 - 表示：decoder block output / residual stream，未经 final norm
-- 多层：同一次 prefill 捕获多个 layer
+- 多层：同一次 prefill 按请求顺序捕获多个 layer
+- 运行时：mixed batch、chunked prefill、radix cache 和并发请求
 - dtype：服务端可以是 BF16；落盘格式固定记录实际 dtype
 - 每个风险类别/上下文属性使用独立 hypothesis suffix
 

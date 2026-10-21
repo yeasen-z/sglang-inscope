@@ -40,6 +40,8 @@ from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.feature_capture.plan import SlotPlan, build_slot_plan
+from sglang.srt.feature_capture.recorder import FeatureCaptureRecorder
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
@@ -566,6 +568,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Borrowed from ScheduleBatch: config / flags (by-value) ===
     # For logprob
     return_logprob: bool = False
+    # Request-scoped feature rows selected for this extend forward.
+    feature_capture_plan: Tuple[SlotPlan, ...] = ()
+    feature_capture_recorder: Optional[FeatureCaptureRecorder] = None
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
     spec_algorithm: SpeculativeAlgorithm = None
@@ -984,6 +989,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             extend_prefix_lens = batch.prefix_lens
             extend_logprob_start_lens = batch.extend_logprob_start_lens
 
+        feature_capture_plan = build_slot_plan(
+            rids=[req.rid for req in batch.reqs],
+            specs=[req.feature_capture for req in batch.reqs],
+            extend_lens=extend_seq_lens,
+            seq_lens=(
+                batch.seq_lens_cpu.tolist()
+                if batch.seq_lens_cpu is not None
+                else ()
+            ),
+            prefix_lens=extend_prefix_lens,
+        )
+        if feature_capture_plan and batch.forward_mode.is_split_prefill():
+            raise ValueError("feature capture v1 does not support split prefill")
+        feature_capture_recorder = (
+            FeatureCaptureRecorder(feature_capture_plan)
+            if feature_capture_plan
+            else None
+        )
+
         # Mirror the grammars-population behavior previously done in
         # ScheduleBatch.get_model_worker_batch.
         if batch.sampling_info is not None:
@@ -1054,6 +1078,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             replace_positions=batch.replace_positions,
             # Scalar config / flags
             return_logprob=batch.return_logprob,
+            feature_capture_plan=feature_capture_plan,
+            feature_capture_recorder=feature_capture_recorder,
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
             can_run_dp_draft_cuda_graph=batch.can_run_dp_draft_cuda_graph,

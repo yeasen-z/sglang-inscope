@@ -131,6 +131,7 @@ class HttpServerEngineAdapter(EngineBase):
         token_ids_logprob=None,
         lora_path=None,
         custom_logit_processor=None,
+        feature_capture=None,
         priority=None,
         session_id=None,
     ):
@@ -145,6 +146,7 @@ class HttpServerEngineAdapter(EngineBase):
             "token_ids_logprob": token_ids_logprob,
             "lora_path": lora_path,
             "custom_logit_processor": custom_logit_processor,
+            "feature_capture": feature_capture,
             "priority": priority,
             "session_id": session_id,
         }

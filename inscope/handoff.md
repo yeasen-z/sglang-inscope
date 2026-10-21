@@ -2,7 +2,7 @@
 
 > 本文是当前项目的唯一快速交接入口。新接手者应先读本文，再按链接进入详细设计。
 >
-> 更新时间：2026-10-19 14:30（Asia/Shanghai）
+> 更新时间：2026-10-20（Asia/Shanghai）
 
 ---
 
@@ -31,7 +31,7 @@ probe 的高 AUROC 只能说明表示中存在可利用信号，不等于模型�
 - 远端 workspace：`/DATA/disk2/workspace/zmosg/sglang-inscope`
 - Git remote：`https://github.com/yeasen-z/sglang-inscope.git`
 - 当前基线：`main@92580581da6fc8542a997a00c1a8b71b03497680`
-- 当前状态：基于上游的干净 fork，生产代码尚未接入 feature capture；已完成设计、移植分析和 P1 纯 Python 骨架。
+- 当前状态：生产推理链路尚未接入 feature capture；设计、移植分析、P0 环境和 P1 纯 Python 骨架已完成。
 
 ### 模型
 
@@ -51,51 +51,48 @@ export INSCOPE_QWEN35_9B_MODEL=/DATA/disk1/models/Qwen3.5-9B
 
 ### P0 环境
 
-正在后台创建：
+当前开发环境：
 
 ```text
-环境：/opt/miniconda3/envs/inscope
+环境：/opt/miniconda3/envs/inscope（Conda env：inscope）
 Python：3.12
-目标 torch：2.14.1
-目标 flashinfer：flashinfer_python[cu13]==0.7.2
-目标：sgl-kernel + pip install -e python
-日志：/DATA/disk1/inscope-build/p0_env.log
+torch：2.14.1+cu130
+flashinfer：flashinfer_python[cu13]==0.7.2
+sglang-kernel：0.4.10
+sglang：当前仓库 python/ 的 editable 安装
 ```
 
-启动脚本：[`scripts/setup_env.sh`](scripts/setup_env.sh)
+editable 安装必须设置 `SGLANG_BUILD_RUST_EXTS=none`，否则 `setup.py` 会发现
+仓库内 Rust workspace 并要求安装 cargo。
 
-查看状态：
+验证：
 
 ```bash
-tail -c 2000 /DATA/disk1/inscope-build/p0_env.log | tr '\r' '\n'
-pgrep -af 'setup_env|pip install|conda create'
+SGLANG_CACHE_DIR="$PWD/.cache/sglang" \
+FLASHINFER_WORKSPACE_BASE="$PWD/.cache" \
+/opt/miniconda3/envs/inscope/bin/python -c 'import sglang; print(sglang.__file__)'
 ```
 
-截至本文更新时间，torch 及部分 CUDA 依赖仍在下载，安装尚未完成。不要重复启动第二个安装进程。
-
-已有环境 `/opt/miniconda3/envs/sglang-ready` 不可直接作为本项目环境，因为它是：
-
-```text
-torch 2.11.0+cu130
-flashinfer 0.6.15.post1
-sglang 0.5.16
-```
-
-与本仓库要求不一致。
+当前沙箱看不到 GPU（`torch.cuda.device_count() == 0`）；GPU E2E 需要在有设备权限的
+运行环境中执行，但这不影响 CPU contract/plan 测试。
 
 ---
 
 ## 3. 已经确定的架构决策
 
-### 3.1 层号语义：必须统一为 HF hidden_states 索引
+### 3.1 层号语义：residual-stream block boundary
 
-用户侧层号 `L` 等于 HuggingFace `outputs.hidden_states[L]`：
+用户侧层号 `L` 表示 block boundary：
 
 - 范围是 `[0, N]`，其中 `N` 是 decoder layer 数；
 - `0` 是 embedding 输出；
 - `L=N` 是最后一个 decoder block 输出、final norm 之前；
 - `-1` 是 `N` 的别名；
 - 内部不加 block offset，不使用“第几个 block”的替代语义。
+
+其中 `L < N` 与 Hugging Face `outputs.hidden_states[L]` 对齐。当前
+Transformers Qwen3 的 `outputs.hidden_states[N]` 已经过 final norm，因此
+`L=N` 的 HF golden 必须从最后一个 decoder block 的 forward hook 获取。
 
 对 Qwen3-8B：`0..36` 都是合法层号，`36` 和 `-1` 指向同一位置。
 
@@ -197,8 +194,10 @@ probe 训练与评估放外部仓库。本仓只保留运行时、契约、手�
 - `schemas/sample.schema.json`；
 - `schemas/feature_record.schema.json`；
 - `schemas/probe_manifest.schema.json`。
+- `test_qwen3_hidden_layer.py`：真实 Qwen3 Engine smoke、响应解码，以及可选 HF BF16 数值对照。
 
-feature record 的 `layer_ids` 必须解释为 HF `outputs.hidden_states[L]`；legacy block-index 数据必须带 `metadata.index_convention = "block"`。
+feature record 的 `layer_ids` 必须解释为上述 block boundary；legacy
+block-index 数据必须带 `metadata.index_convention = "block"`。
 
 ### P1 纯 Python 骨架
 
@@ -213,17 +212,27 @@ feature record 的 `layer_ids` 必须解释为 HF `outputs.hidden_states[L]`；l
   - 不采集的请求仍推进 flat-row offset；
   - layer slot layout；
   - 优先使用 `extend_prefix_lens_cpu`。
+- `python/sglang/srt/feature_capture/capabilities.py`
+  - `SGLANG_ENABLE_FEATURE_CAPTURE` 默认关闭；
+  - v1 未验证配置逐项 fail-fast；
+  - 模型适配通过 `feature_capture_sites` 类属性探测。
+- `python/sglang/srt/feature_capture/bridge.py`
+  - 合并 feature hook 与既有 auxiliary hook；
+  - 不使用模块级运行时状态；
+  - 不信任生产者的 `owned=True`，feature 路径固定复制。
 - `test/registered/unit/feature_capture/test_feature_capture_spec.py`；
 - `test/registered/unit/feature_capture/test_feature_capture_plan.py`。
 
-当前纯 CPU 桩测试结果：**40 tests passed**。README 中的旧文字仍写着 39，后续应改为 40。
+最新 CPU 回归结果：feature-capture 套件加 output-streamer 相关测试
+**87 passed**（另有 35 个 subtests）。
 
 运行真实测试环境完成后执行：
 
 ```bash
 cd /DATA/disk2/workspace/zmosg/sglang-inscope
-PY=/opt/miniconda3/envs/inscope/bin/python
-$PY -m pytest test/registered/unit/feature_capture/ -q
+SGLANG_CACHE_DIR="$PWD/.cache/sglang" \
+FLASHINFER_WORKSPACE_BASE="$PWD/.cache" \
+/opt/miniconda3/envs/inscope/bin/python -m pytest test/registered/unit/feature_capture/ -q
 ```
 
 ---
@@ -309,57 +318,46 @@ patch 是导出物，禁止手改。
 
 ## 7. 当前下一步（按顺序执行）
 
-### 第一步：等待/验证 P0
+### 已完成：P2 GPU 验证
 
-不要重复启动安装。安装完成后验证：
+请求透传、recorder、Qwen3 callback、auxiliary output 和 response encoding
+已经接通并通过真实模型验证：
 
-```bash
-PY=/opt/miniconda3/envs/inscope/bin/python
-$PY -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.device_count())'
-$PY -c 'import sglang; print(sglang.__file__)'
-$PY -c 'from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker; print("baseline plumbing OK")'
-```
+- Qwen3-8B BF16 五层与 HF 对应 block boundary 数值对齐；最大 relative L2 约 1.4%；
+- Qwen3-8B-FP8 在 Triton FP8 GEMM 后端完成五层真实 capture；
+- explicit 与 suffix_last 逐元素一致，shape/dtype/finite 检查通过；
+- DeepGEMM 首次自动调优与 feature capture 正确性分离，不把调优时间计作 capture 开销。
 
-然后跑：
+### 已完成：P3
 
-```bash
-$PY -m pytest test/registered/unit/feature_capture/ -q
-```
+- 乱序多层 `[36, 0, 20, 1, 35]` + 多位置 `[0, 10, 20]` 与独立请求逐元素一致；
+- 混合 batch（无 capture / 单层 / 多层多位置）与独立请求一致；
+- 84-token 输入、16-token chunk 的首/中/末位置跨块结果完整；
+- radix cache 热请求从最早目标位置开始重算，保留此前 KV 命中，冷/热结果逐元素一致。
+- 三个独立并发请求与各自串行基准逐元素一致，rid/层/位置未串线；
+- 开启 capability 但不传 capture 的普通确定性生成 token/text 一致，且无非空 features。
 
-### 第二步：完成 P1
+### 已完成：P4 最小闭环
 
-新增并测试：
+普通生成与 `generate+features` 均生成 8 token，token ids/text 完全一致；
+feature 正常返回且只对应 prompt 位置，decode 阶段没有重复采集。
 
-- `capabilities.py`：启动拒绝表和 `INSCOPE_FEATURE_CAPTURE=0` 开关；
-- `bridge.py`：从 request/forward batch 获取 capture plan，并桥接到 layer callback；
-- 纯 CPU 单元测试覆盖每个 capability rejection。
+### 已完成：P5
 
-### 第三步：P2 最小闭环
+Qwen3.5-9B checkpoint 顶层包含视觉塔，使用 SGLang 的
+`--language-model-only`/`language_model_only=True` 只加载 Dense text tower。
+通用 bridge 增加 accumulator-style boundary 适配器，模型侧仍保持一个 layer
+collector、一个 final norm hook 和一个 `feature_capture_sites` 声明。真实 GPU 验证：
 
-目标：Qwen3-8B-FP8 + `Engine.generate()` + `prefill_only` + 单层单位置。
+- 层 `[0,1,16,31,32]` explicit/suffix 逐元素一致；
+- 乱序层 `[32,0,16,1,31]` × 位置 `[0,11,22]` 与独立请求一致；
+- `generate+features` 的 8 个生成 token/text 与普通生成一致；
+- 稳定 capture 请求约 41–42 ms（首次 GDN/Triton 编译不计）。
 
-最小闭环应验证：
+### 下一步：交付整理 / P6
 
-1. 没有 `feature_capture` 时普通 `generate` 完全不改变；
-2. `feature_capture` 请求被 tokenizer manager 校验；
-3. Qwen3 层边界收到 callback；
-4. 结果通过 feature auxiliary output 传输；
-5. `Engine.generate()` 返回带 feature metadata 的结果；
-6. HF reference 与 SGLang capture 在 BF16 模型上 cosine/最大误差达标；
-7. FP8 只与对应 SGLang FP8/HF FP8 reference 比较，不与 BF16 逐位比较。
-
-### 第四步：P3/P4
-
-覆盖：
-
-- 多层；
-- 多位置；
-- suffix_last；
-- chunked prefill；
-- radix cache 命中和重算去重；
-- 并发请求；
-- `generate+features`；
-- 仍不采 decode。
+先整理提交边界、上游跟随说明和完整验收命令；probe 训练与 SafeGauge 式实验
+仍按 R3 放在外部仓库，本仓不引入数据集或训练依赖。
 
 ### 第五步：P5
 
@@ -371,7 +369,7 @@ $PY -m pytest test/registered/unit/feature_capture/ -q
 
 实现前每次都检查：
 
-- [ ] 是否把 HF layer index 错写成 block index？
+- [ ] 是否把 `L=N` 错拿 HF post-final-norm 的 `hidden_states[N]` 作参考？
 - [ ] 是否手动 `hidden + residual`？如果是，停止并改用 callback value；
 - [ ] 是否把结果放进会被 `sample()` 清空的 `auxiliary_device_output`？
 - [ ] 是否漏掉 chunked prefill 中间块？
@@ -411,6 +409,7 @@ $PY -m pytest test/registered/unit/feature_capture/ -q
 | P1 契约测试 | `test/registered/unit/feature_capture/test_feature_capture_spec.py` |
 | P1 行规划测试 | `test/registered/unit/feature_capture/test_feature_capture_plan.py` |
 | 手工测试设计 | `test/manual/feature_capture/DESIGN.md` |
+| 真实模型验收入口 | `test/manual/feature_capture/test_qwen3_hidden_layer.py` |
 
 ---
 
@@ -422,9 +421,13 @@ $PY -m pytest test/registered/unit/feature_capture/ -q
 前作调研完成
 → 架构设计和关键取舍完成
 → fork/patch 开发逻辑完成
-→ P1 纯 CPU contract/plan 骨架完成，40 tests passed
-→ P0 环境安装进行中
-→ 下一步接 capabilities/bridge，再进入 Qwen3-8B-FP8 最小闭环
+→ P0 editable 开发环境完成
+→ P1 请求契约与行规划完成
+→ P2 运行时通路、公开 Engine API 与启动 capability gate 完成
+→ P3 多层多位置、混合 batch、chunked prefill、radix cache、并发与普通生成回归通过
+→ P4 generate + features 通过，开启 capture 不改变生成 token
+→ P5 Qwen3.5-9B Dense text tower 的显式/后缀位置、乱序层与 generate + features 通过
+→ 当前进入代码整理、静态检查和交付拆分阶段
 ```
 
 最重要的实现原则只有一句：

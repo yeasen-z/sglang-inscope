@@ -180,3 +180,25 @@ def layout_slots(entries: Sequence[FeaturePlanEntry]) -> Tuple[SlotPlan, ...]:
         )
         offset += len(rows)
     return tuple(slots)
+
+
+def build_slot_plan(
+    *,
+    rids: Sequence[str],
+    specs: Sequence[Optional["FeatureRequestSpec"]],
+    extend_lens: Optional[Sequence[int]],
+    seq_lens: Sequence[int],
+    prefix_lens: Optional[Sequence[int]] = None,
+) -> Tuple[SlotPlan, ...]:
+    """Build one forward's complete slot plan, or no plan for decode/idle."""
+    if extend_lens is None or not any(spec is not None for spec in specs):
+        return ()
+    return layout_slots(
+        build_entries(
+            rids=rids,
+            specs=specs,
+            extend_lens=extend_lens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+        )
+    )

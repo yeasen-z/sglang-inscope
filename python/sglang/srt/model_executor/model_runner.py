@@ -81,6 +81,7 @@ from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.feature_capture.recorder import attach_feature_output
 from sglang.srt.layers.cp.utils import (
     get_cp_strategy,
     is_cp_active,
@@ -193,6 +194,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -706,6 +708,7 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        self.maybe_init_feature_capture()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 
         self.maybe_init_dwdp()
@@ -1250,6 +1253,36 @@ class ModelRunner:
         # so keep the PP group it was built with; read every other placement
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
+
+    def maybe_init_feature_capture(self):
+        from sglang.srt.feature_capture.capabilities import (
+            FeatureCaptureCapabilities,
+            is_enabled,
+            validate_capabilities,
+        )
+
+        if not is_enabled():
+            return
+        parallel = get_parallel()
+        validate_capabilities(
+            FeatureCaptureCapabilities(
+                device=torch.device(self.device).type,
+                model_name=type(self.model).__name__,
+                model_sites=tuple(
+                    getattr(type(self.model), "feature_capture_sites", ())
+                ),
+                pp_size=self.pp_group.world_size,
+                dp_attention=parallel.enable_dp_attention,
+                attn_cp_size=parallel.attn_cp_size,
+                dcp_size=parallel.dcp_size,
+                two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
+                attn_tp_input_scattered=parallel.enable_attn_tp_input_scattered,
+                layernorm_sp=parallel.enable_layernorm_sp,
+                speculative=self.spec_algorithm.is_speculative(),
+                disaggregation_mode=get_disagg().disaggregation_mode,
+                multimodal=self.model_config.is_multimodal,
+            )
+        )
 
     def load_model(self):
         tic_total = time.perf_counter()
@@ -2001,6 +2034,7 @@ class ModelRunner:
                 )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                and not forward_batch.feature_capture_plan
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
@@ -2035,6 +2069,10 @@ class ModelRunner:
                 and self.pp_group.is_last_rank
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
+
+            attach_feature_output(
+                logits_output=ret, recorder=forward_batch.feature_capture_recorder
+            )
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

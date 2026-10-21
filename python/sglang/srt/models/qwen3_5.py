@@ -49,6 +49,7 @@ from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.feature_capture import bridge as feature_capture
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -1676,6 +1677,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    feature_capture_sites = ("block_output",)
+
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
     packed_modules_mapping = {
@@ -1919,9 +1922,15 @@ class Qwen3_5ForCausalLM(nn.Module):
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
-                    captured_last_layer_outputs=aux_hidden_states
-                    if getattr(layer, "_is_layer_to_capture", False)
-                    else None,
+                    captured_last_layer_outputs=feature_capture.layer_capture_accumulator(
+                        layer=layer_idx,
+                        recorder=forward_batch.feature_capture_recorder,
+                        auxiliary_accumulator=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    ),
                 )
 
             # Process deepstack embeddings if provided
@@ -1944,6 +1953,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states,
             forward_batch,
             self.norm,
+            capture=feature_capture.final_capture(
+                num_layers=len(self.layers),
+                recorder=forward_batch.feature_capture_recorder,
+            ),
             finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
             skip_empty=True,
         )
@@ -2343,6 +2356,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    feature_capture_sites = ("block_output",)
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 

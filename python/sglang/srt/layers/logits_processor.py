@@ -280,6 +280,8 @@ class LogitsProcessorOutput:
 
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
+    # Kept separate because ModelRunner.sample() clears auxiliary_device_output.
+    feature_device_output: Optional[DeviceAuxiliaryOutput] = None
 
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:

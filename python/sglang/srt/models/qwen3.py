@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.feature_capture import bridge as feature_capture
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -501,14 +502,27 @@ class Qwen3Model(Qwen2Model):
                 positions,
                 hidden_states,
                 forward_batch,
-                capture_output=aux_hidden_states.capture
-                if i in self.layers_to_capture
-                else None,
+                capture_output=feature_capture.layer_capture(
+                    layer=i,
+                    recorder=forward_batch.feature_capture_recorder,
+                    auxiliary_hook=(
+                        aux_hidden_states.capture
+                        if i in self.layers_to_capture
+                        else None
+                    ),
+                ),
             )
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.final_norm(
-            hidden_states, forward_batch, self.norm, skip_empty=True
+            hidden_states,
+            forward_batch,
+            self.norm,
+            capture=feature_capture.final_capture(
+                num_layers=len(self.layers),
+                recorder=forward_batch.feature_capture_recorder,
+            ),
+            skip_empty=True,
         )
         return (
             (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
@@ -516,6 +530,7 @@ class Qwen3Model(Qwen2Model):
 
 
 class Qwen3ForCausalLM(nn.Module):
+    feature_capture_sites = ("block_output",)
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",

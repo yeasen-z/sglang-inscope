@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.feature_capture.spec import FeatureRequestSpec
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -1026,6 +1027,7 @@ class Req(ReqDllmMixin):
         custom_logit_processor: Optional[str] = None,
         require_reasoning: bool = False,
         return_hidden_states: ReturnHiddenStatesMode = False,
+        feature_capture: Optional[FeatureRequestSpec] = None,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
@@ -1128,6 +1130,8 @@ class Req(ReqDllmMixin):
         self.return_hidden_states_mode = get_return_hidden_states_mode(
             return_hidden_states
         )
+        self.feature_capture = feature_capture
+        self.feature_capture_values: Dict[Tuple[int, int], torch.Tensor] = {}
 
         # Extra key for caller-defined request classification.
         if lora_id is not None:
@@ -1732,6 +1736,20 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        if self.feature_capture is not None:
+            pending_positions = (
+                position
+                for position in self.feature_capture.positions
+                if any(
+                    (layer, position) not in self.feature_capture_values
+                    for layer in self.feature_capture.layers
+                )
+            )
+            earliest_pending = min(pending_positions, default=None)
+            if earliest_pending is not None:
+                # Prefix KV contains no intermediate residuals. Recompute from
+                # the first target whose requested layers are not all captured.
+                max_prefix_len = min(max_prefix_len, earliest_pending)
         if (
             self.dllm_config is not None
             and self.dllm_config.requires_separate_context_encoding

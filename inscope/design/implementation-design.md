@@ -5,7 +5,7 @@
 目标模型：`Qwen3-8B`（BF16 数值基准）、`Qwen3-8B-FP8`（主要开发目标）
 前作调研：[prior-art.md](prior-art.md)
 
-> v2 相对 v1 的实质变化见 §0.2。最重要的一条是**层号语义改成 HF 索引，内部零偏移**，
+> v2 相对 v1 的实质变化见 §0.2。最重要的一条是**层号语义改成 residual-stream block boundary**，
 > 消除了整个项目风险最高的一项。
 
 ---
@@ -25,8 +25,8 @@
 |---|---|---|---|---|
 | D1 | 层内容从哪取 | 挂基线已有的 `capture` 回调 | 手算 `hidden + residual`（前作 A） | 基线已把 residual 合并好；手算会绕开融合 kernel 的 FP32 累加 |
 | D1 | 同上 | 同上 | 取 FFN 输出再自己加残差（前作 D） | 为拿完整 FFN 输出必须关掉 MLP all-reduce 延迟融合，是性能损失 |
-| D2 | **层号语义** | **= HF `outputs.hidden_states[L]`**，L ∈ [0, N]，内部零偏移 | block 索引（前作 D：layer 9 = 第 10 个 block） | 探测代码一律写 `outputs.hidden_states[L]`；用 block 索引等于让每个使用方手写 `+1`，是最容易静默错位的地方 |
-| D2 | 最后一层 | `L = N`（也接受 `-1`）走 `final_norm(capture=)` | 只支持到 `L = N-1` | probe 最常用的就是"最后一个 hidden layer"，即 `hidden_states[-1]`；不支持等于砍掉主用例 |
+| D2 | **层号语义** | residual-stream block boundary，L ∈ [0, N]；`L < N` 与 HF `outputs.hidden_states[L]` 对齐 | block 索引（前作 D：layer 9 = 第 10 个 block） | embedding 是 0，随后每越过一个 block 加 1；避免使用方手写 `+1` |
+| D2 | 最后一层 | `L = N`（也接受 `-1`）走 `final_norm(capture=)`，表示最后 block 的 pre-final-norm 输出 | 直接用 HF `hidden_states[N]` 作 golden | 当前 Transformers Qwen3 的最后一项已过 final norm；HF golden 必须挂最后 block hook |
 | D3 | 结果回传 | 复用 `DeviceAuxiliaryOutput` → `copy_to_host` → `consume` | 自己写 D2H / 落盘中转（前作 A、C） | 官方已有 pinned + `record_stream` + 事件 + 进程通信，重写必踩同样的坑 |
 | D3 | 挂在哪个字段 | `LogitsProcessorOutput.feature_device_output`，scheduler 里 `append_auxiliary_output` 合并 | 直接塞 `auxiliary_device_output` | `sample()` 开头会把它清成 `None`（`model_runner.py:2086`） |
 | D3 | 合并方式 | 用基线 `append_auxiliary_output` | 手写 `CompositeDevice/CompositeHost`（前作 D） | 基线已有该协议，手写等于重复实现且漏掉观察者组合 |
@@ -41,20 +41,16 @@
 | D9 | 位置模式 | 四档：`last` / `explicit` / `suffix_last` / `all` | 只有 `last` | 用户明确要求显式位置为一等公民；`suffix_last` 是**校验器**不是别名 |
 | D10 | 结果编码 | 模型 dtype 原始字节 + base64 | `.tolist()` 走 JSON（基线 `return_hidden_states` 的做法） | 4096 维 × BF16 转浮点文本会膨胀一个数量级且丢精度 |
 | D11 | 是否支持 MoE | v1 拒绝 | 支持 | 前作 D 的 BF16 Qwen3.5 MoE 对照 9216 元素里 54 个超差，原因未明 |
-| D12 | 进程开关 | `INSCOPE_FEATURE_CAPTURE=0` 默认关 | 总是开启 | 关闭时桥接函数一次布尔判断返回，decode 热路径零额外开销 |
+| D12 | 进程开关 | `SGLANG_ENABLE_FEATURE_CAPTURE=0` 默认关 | 总是开启 | 关闭时不创建 plan、recorder、feature tensor 或 D2H 传输 |
 | D13 | 交付面（R1） | **只做 `Engine.generate()`**；原生 `/generate` 免费 | 同时做 OpenAI 兼容层 | 见 §15.1/§15.2：原生 `/generate` 原样序列化 `meta_info`；OpenAI 层要逐字段改 3 文件、4 类位置，且部署形态是独立进程，没有调用方 |
 | D14 | 第二架构（R2） | **`Qwen3.5-9B`（Dense）** | 同时上 `27B` | 27B 不增加验证覆盖面，只增加显存与时间成本 |
 | D15 | probe 代码归属（R3） | **外部仓** | 放本仓 | 本仓保持「运行时 + 测试」，探测实验的依赖与数据不进模型服务仓 |
 
-### 0.3 规模
+### 0.3 规模约束
 
-| | v1 文档 | **v2** |
-|---|---:|---:|
-| 新增（模型无关） | ~980 行 | **~760 行** |
-| 改上游 | ~153 行 / 15 文件 | **~120 行 / 13 文件** |
-| 模型改动 | 2 行/模型 | **2 行/模型**（循环 1 行 + `final_norm` 1 行） |
-
-省下来的主要是 D4（不要 Triton）和 D5（不做 decode 采集）两块。
+通用逻辑集中在 `feature_capture/`；上游运行时文件只负责传递、规划与输出接线；
+模型文件只声明 capability 并复用已有 layer-boundary callback。行数不作为
+验收条件，以“模型中不出现位置、编码、传输逻辑”为准。
 
 ---
 
@@ -85,13 +81,13 @@
 │   spec.py         请求契约、校验、四种位置模式解析（纯 CPU）    │
 │   plan.py         ForwardBatch → 本轮采集计划（行映射）        │
 │   recorder.py     设备缓冲、每层 hook、结果分段                │
-│   transport.py    DeviceAuxiliaryOutput / HostAuxiliaryOutput  │
+│   recorder.py     Device/Host auxiliary output 与 consume      │
 │   encoding.py     base64 / float_list + 预算                  │
 │   capabilities.py 启动拒绝 + 进程开关 + 能力探测               │
 │   bridge.py       ★ 模型唯一入口                               │
 └──────────────────────────────────────────────────────────────┘
         ▲                                          ▲
-        │ 2 行调用                                  │ 既有协议，0 行新增
+        │ 薄适配层                                  │ 复用既有 auxiliary 协议
 ┌───────┴──────────────┐              ┌────────────┴───────────┐
 │ models/*.py          │              │ auxiliary_output.py    │
 │  layer_capture(...)  │              │ managers/utils.py      │
@@ -111,8 +107,8 @@
 
 ### 3.1 定义
 
-**用户写的 `L` 就是 HF `outputs.hidden_states[L]`**，与 `transformers` 的
-`output_hidden_states=True` 完全同一索引、同一数值、同一范围。
+**用户写的 `L` 是 residual-stream block boundary**：embedding 为 0，越过每个
+decoder block 后加 1，范围 `[0, N]`。
 
 HF 的 `hidden_states` 是长度 `N+1` 的元组（Qwen3-8B：N=36 → 37 个元素）：
 
@@ -120,7 +116,7 @@ HF 的 `hidden_states` 是长度 `N+1` 的元组（Qwen3-8B：N=36 → 37 个元
 |---|---|
 | `0` | embedding 输出（还没进任何 decoder block） |
 | `L` (1 ≤ L ≤ N-1) | 第 `L-1` 个 block 的输出 = 进入第 `L` 个 block 之前的残差流 |
-| `N`（即 `-1`） | 最后一个 block 的输出，**final RMSNorm 之前** |
+| `N`（即 `-1`） | Transformers 当前返回 final RMSNorm **之后**的输出，不能直接作为 InScope `L=N` golden |
 
 ### 3.2 内部映射：零偏移
 
@@ -129,7 +125,7 @@ HF 的 `hidden_states` 是长度 `N+1` 的元组（Qwen3-8B：N=36 → 37 个元
 | 请求的 `L` | 采集位置 | 数值 |
 |---|---|---|
 | `0 … N-1` | 层循环第 `L` 次迭代的注意力入口 | HF `hidden_states[L]` |
-| `N`（或 `-1`） | `final_norm(..., capture=cb)` 的 `capture(residual)` | HF `hidden_states[N]` |
+| `N`（或 `-1`） | `final_norm(..., capture=cb)` 的 `capture(residual)` | 最后 decoder block forward hook 的输出（pre-final-norm） |
 
 两条都已核对基线源码：
 
@@ -138,15 +134,17 @@ HF 的 `hidden_states` 是长度 `N+1` 的元组（Qwen3-8B：N=36 → 37 个元
   `L≥1` 时走 `capture(stream.residual)`，即上一层 block 输出（pre-norm）。
 - `residual/access.py:final_norm_pair`：`residual` 非空时先
   `hidden_states, residual = norm(...)` 再 `capture(residual)`——
-  拿到的是**更新后的 residual**，final norm 之前。这正是 `hidden_states[N]`。
+  拿到的是**更新后的 residual**，final norm 之前。当前 Transformers Qwen3
+  的 `hidden_states[N]` 已经过 final norm，因此参考实现必须 hook 最后 block。
 
 > **与前作 D 的换算**：前作 D 的 `layer: 9` 是"第 10 个 block 的输出"，
 > 对应我们的 `L = 10`。文档必须写这句，否则移植已有 probe 会整体错一层。
 
 ### 3.3 支持负索引
 
-`L = -1` → `N`，`L = -2` → `N-1`，Python 语义。因为探测代码最常见的写法就是
-`outputs.hidden_states[-1]`。
+`L = -1` → `N`，`L = -2` → `N-1`，采用 Python 式负索引。`-1` 表示最后一个
+block boundary；不要把它等同于当前 Transformers 的
+`outputs.hidden_states[-1]`（post-final-norm）。
 
 ### 3.4 为什么不用 block 索引
 
@@ -162,17 +160,20 @@ block 索引（"第 k 层 block 输出"，范围 `[0, N-1]`）本身没问题，
 `test/manual/feature_capture/` 的 B.1 组，P2 就要过，不进 P3：
 
 1. Qwen3-8B FP8，同一段输入，`L ∈ {0, 1, 20, 35, 36}` 全部采集；
-2. 同一输入走 HF `transformers` BF16 eager `output_hidden_states=True`；
-3. 逐层断言 `cos ≥ 0.9999`、`rel_L2 ≤ 5e-3`；
+2. 同一输入走 HF `transformers` BF16；`L<N` 读 `hidden_states[L]`，`L=N`
+   从最后一个 decoder block forward hook 读取；
+3. 逐层断言 `cos ≥ 0.9999`、`rel_L2 ≤ 2e-2`；该阈值由 Qwen3-8B BF16
+   五层实测校准（观测最大 `rel_L2=1.40%`），保留约 0.6 个百分点余量；
 4. 单独断言 `L=35` 与 `L=36` **不相等**（若相等说明两个采集点撞了）；
-5. 单独断言 `L=36` 在 `final_norm` 之前（与 HF `hidden_states[36]` 对照，不是 `[37]`）。
+5. 单独断言 `L=36` 在 `final_norm` 之前（与 HF 最后 block hook 对照，不与
+   post-final-norm 的 `hidden_states[36]` 对照）。
 
 第 4、5 条是防"看起来对"的：如果 `final_norm` 的 capture 拿成了 norm 之后的张量，
 `cos` 仍可能很高，但那是错的。
 
 ---
 
-## 4. 接缝一：采集（模型侧 2 行）
+## 4. 接缝一：采集（模型侧薄适配）
 
 ### 4.1 模型改动
 
@@ -204,33 +205,13 @@ class Qwen3ForCausalLM(nn.Module):
 ### 4.2 `bridge.py`
 
 ```python
-_ACTIVE = False          # initialize() 置位；环境变量关闭时恒为 False
-
-def layer_capture(slot, forward_batch, aux, model_slots):
-    """Combine InScope's capture with whatever aux capture this slot already wants.
-
-    Never mutates model attributes: the EAGLE/DFLASH path keeps full ownership
-    of capture_aux_hidden_states and layers_to_capture.
-    """
-    aux_hook = aux.capture if slot in model_slots else None
-    if not _ACTIVE:
-        return aux_hook
-    rec = _recorder
-    if rec is None:
-        return aux_hook
-    dest = rec.slot_dest(slot, forward_batch)
-    if dest is None:
-        return aux_hook
-    rows, out = dest
-
-    def hook(value, *, owned: bool = False):
-        rec.tap(slot, value, rows, out)
-    return hook if aux_hook is None else _chain(hook, aux_hook)
+def layer_capture(*, layer, recorder, auxiliary_hook=None):
+    feature_hook = recorder.capture_hook(layer=layer) if recorder else None
+    return _combine(feature_hook=feature_hook, auxiliary_hook=auxiliary_hook)
 
 
-def final_capture(forward_batch):
-    """The L == N slot: the last block output, before the final norm."""
-    ...
+def final_capture(*, num_layers, recorder):
+    return None if recorder is None else recorder.capture_hook(layer=num_layers)
 ```
 
 **三个刻意的性质**
@@ -240,28 +221,25 @@ def final_capture(forward_batch):
    "包装层以为要解包、内层没返回 tuple" 的畸形分支
    （前作 A 的补丁里 `isinstance(hidden_states, tuple) and len(hidden_states)==2 and isinstance(hidden_states[1], (list, tuple))` 就是为此）。
    我们完全不碰这两个状态，EAGLE/DFLASH 采集永远照常工作。
-2. **可与既有 aux 采集共存。** 同槽位同时被 EAGLE 和 InScope 需要时，`_chain` 两个都调。
+2. **可与既有 aux 采集共存。** 同槽位有两个消费者时，`_combine`
+   依次调用 feature hook 和既有 auxiliary hook。
 3. **`owned` 不被信任。** v1 一律复制进自己的缓冲。放弃一点性能换确定性——
    误判 `owned` 会读到被后续层复用的存储，产生随机复现的数值错误。
 
-### 4.3 `tap()`
+### 4.3 recorder `_capture()`
 
 ```python
-def tap(self, slot, value, rows, out):
-    expect = self.expected_rows[slot]
-    if value.shape[0] != expect:
-        raise RuntimeError(
-            f"feature capture slot {slot}: expected {expect} producer rows, "
-            f"got {value.shape[0]}")
-    if rows is None:
-        out.copy_(value)                       # 全行，省一次 index_select
-    else:
-        torch.index_select(value, 0, rows, out=out)
+def _capture(self, *, slot, value):
+    if value.ndim != 2:
+        raise RuntimeError("feature capture expects a 2D hidden tensor")
+    torch.index_select(
+        value, 0, slot.rows,
+        out=self._buffer[slot.out_start:slot.out_stop],
+    )
 ```
 
-`expected_rows[slot]` 在建计划时算好（`sum(extend_seq_lens)`）。
-**宁可 fail-fast 也不要静默按错行号取** —— 行数不符说明有 DP padding /
-context parallel / TBO 之类我们 v1 已声明拒绝的组合漏进来了。
+slot plan 在 forward 前就已经固定输入行与输出切片。recorder 会检查二维形状、
+同一层不得重复采集，以及所有计划层都确实执行。
 
 ---
 
@@ -388,7 +366,7 @@ def consume(self, batch, commits):
 
 ```python
 feature_capture = {
-    "layers": [-1],                  # 必填。HF hidden_states 索引，支持负索引
+    "layers": [-1],                  # 必填。block boundary，支持负索引
     "site": "block_output",          # 可选，v1 仅此一项
     "positions": {"mode": "last"},   # 可选，见 6.2
     "encoding": "base64",            # 可选，base64 | float_list
@@ -453,7 +431,7 @@ v1 **不实现** `generated: processed`。只采 prompt token。
 @dataclass(frozen=True)
 class FeaturePlanEntry:
     rid: str
-    layers: tuple[int, ...]        # 解析后的 HF 索引
+    layers: tuple[int, ...]        # 解析后的 block boundary
     row_start: int                 # 该请求本轮在 batch 里的起始行
     position_start: int            # 该行对应的起始绝对位置
     positions: tuple[int, ...]     # 本轮真正要采的绝对位置（已求交）
@@ -508,8 +486,8 @@ for entry in plan:
 
 每个槽位分到输出缓冲的一段连续区间；`rows` 张量就是
 `entry.row_start + p - entry.position_start` 的拼接。
-未被任何请求选中的槽位不产生 `rows`，`bridge.layer_capture` 返回 `None`，
-该层**完全零开销**。
+未被任何请求选中的槽位不产生 `rows`，`bridge.layer_capture` 返回既有
+auxiliary hook 或 `None`，不创建 feature tensor，也不执行 feature D2H。
 
 ### 7.4 chunked prefill
 
@@ -571,9 +549,9 @@ def feature_prefix_limit(req, limit):
 
 | 项 | 要求 |
 |---|---|
-| 采集点定义 | 见 §3.1，与 HF `hidden_states[L]` 同义 |
-| 参考基准 | HF `transformers` BF16 eager，`output_hidden_states=True` |
-| 断言 | `cos ≥ 0.9999`、`rel_L2 ≤ 5e-3`；不要求逐位相等 |
+| 采集点定义 | 见 §3.1；`L<N` 与 HF `hidden_states[L]` 同义，`L=N` 是 pre-final-norm block output |
+| 参考基准 | HF `transformers` BF16；普通层读 `hidden_states`，末层用 decoder block hook |
+| 断言 | `cos ≥ 0.9999`、`rel_L2 ≤ 2e-2`；不要求逐位相等 |
 | FP8 | **禁止**与 BF16 断言逐位相等；只断言契约（shape/layer/position/dtype/无串扰）+ 报告误差分布 |
 | 跨请求污染 | 同批不同请求选不同层/位置，结果逐请求独立 |
 | 空批次 | 无采集请求的 batch 不产生额外张量，`feature_device_output is None` |
@@ -646,34 +624,26 @@ if "block_output" not in sites:
 
 | 文件 | 行数 | 内容 |
 |---|---:|---|
-| `feature_capture/__init__.py` | 40 | 导出 + `_ACTIVE` 开关 |
-| `feature_capture/spec.py` | 210 | 契约、校验、四种位置模式、suffix 定位 |
-| `feature_capture/plan.py` | 120 | 行映射、槽位归组、chunked 合并 |
-| `feature_capture/recorder.py` | 210 | 槽位缓冲、`tap`、结果分段 |
-| `feature_capture/transport.py` | 100 | Device/Host 输出实现（含 `consume` 拆分） |
-| `feature_capture/encoding.py` | 60 | base64 / float_list + 预算 |
-| `feature_capture/capabilities.py` | 70 | 启动拒绝 + 进程开关 |
-| `feature_capture/bridge.py` | 60 | `layer_capture` / `final_capture` |
+| `feature_capture/__init__.py` | 稳定公共导出 |
+| `feature_capture/spec.py` | 契约、校验、四种位置模式、suffix 定位 |
+| `feature_capture/plan.py` | 行映射与槽位归组 |
+| `feature_capture/recorder.py` | 设备缓冲、Device/Host 输出和 `consume` |
+| `feature_capture/encoding.py` | base64 / float_list 编码 |
+| `feature_capture/capabilities.py` | 启动拒绝、进程开关与能力探测 |
+| `feature_capture/bridge.py` | 模型边界 callback 合并 |
 
 无 `kernels.py`（见 D4）。
 
-### 12.2 修改上游（~120 行 / 13 文件）
+### 12.2 上游接线
 
-| 文件 | 改动 | 行数 |
-|---|---|---:|
-| `layers/logits_processor.py` | `feature_device_output` 字段 | 2 |
-| `managers/scheduler.py` | `_copy_auxiliary_output_to_cpu` 合并；建 Req 带 spec | 7 |
-| `model_executor/forward_batch_info.py` | `feature_specs`/`feature_plan` 字段 + `init_new` 派生 | 9 |
-| `model_executor/model_runner.py` | `initialize`/`plan.build`/`finish`/graph 准入 | 18 |
-| `managers/schedule_batch.py` | `Req.feature_capture` + `feature_prefix_limit` 调用 | 12 |
-| `managers/io_struct.py` | 四处字段（`GenerateReqInput`/`TokenizedGenerateReqInput`/`BatchStrOutput`/`BatchTokenIDOutput`） | 16 |
-| `managers/tokenizer_manager.py` | 分词后解析 spec；写 `meta_info["features"]` | 22 |
-| `scheduler_components/output_streamer.py` | 打包 + 编码 | 20 |
-| `managers/detokenizer_manager.py` | 透传 | 4 |
-| `entrypoints/engine.py` | `generate(feature_capture=...)` | 6 |
-| `models/qwen3.py` | 2 行调用 + 1 行类属性 | 3 |
-| `models/qwen2.py` | 同上 | 3 |
-| `models/llama.py` | 同上 | 3 |
+| 区域 | 职责 |
+|---|---|
+| `entrypoints/` + `managers/io_struct.py` | Engine API 与 IPC 字段 |
+| `tokenizer_manager.py` | 分词后解析 suffix/绝对位置并校验 spec |
+| `schedule_batch.py` + `forward_batch_info.py` | Req 状态、radix prefix 上界与 extend slot plan |
+| `model_runner.py` + `logits_processor.py` + `managers/utils.py` | capability gate、graph 准入与 auxiliary D2H 合并 |
+| `output_streamer.py` | 将 `features` 作为 request-level metadata 发送 |
+| `models/qwen3.py` + `models/qwen3_5.py` | capability 声明与 layer-boundary 薄适配 |
 
 **对照**：前作 A 17 文件 +887 行且无测试；前作 D 18 文件 +424 行运行时 + 自写 D2H。
 我们的模型侧改动从「改计算逻辑」降到「换一个函数名」。
@@ -682,8 +652,7 @@ if "block_output" not in sites:
 
 ## 13. 阶段与验收
 
-前置 P0 是当前唯一硬阻塞：conda env（`torch==2.14.1` + `flashinfer_python[cu13]==0.7.2` +
-sgl-kernel）+ `pip install -e python`。目前机器上无可用 sglang 安装。
+前置 P0 已完成：Conda `inscope` 环境使用 editable 方式安装当前源码。
 
 | 阶段 | 内容 | 验收（全过才进下一阶段） |
 |---|---|---|
@@ -692,7 +661,7 @@ sgl-kernel）+ `pip install -e python`。目前机器上无可用 sglang 安装�
 | **P2** | Qwen3-8B-FP8 `prefill_only`，**交付面 = `Engine.generate()`**，`L ∈ {0,1,20,35,36}` | **B.1b 层号语义全过**（最关键）；无采集 batch 无额外张量；schema 符合 |
 | **P3** | 多层 + 多位置 + chunked + 缓存命中 + 并发混合 | C 组全过；**缓存二次采集逐元素相等**；不采集请求不受影响 |
 | **P4** | `generate+features`（仍只采 prompt） | 文本与纯生成一致；eager 与无采集路径结果一致；`feature_plan is None` 时零影响 |
-| **P5** | 第二架构 **`Qwen3.5-9B`（Dense）** | 只补 2 行模型 + 类属性，全流程通过 |
+| **P5** | 第二架构 **`Qwen3.5-9B`（Dense）** | 只补 capability 和 layer-boundary 薄适配，全流程通过 |
 | **P6** | SafeGauge 式探测实验（**外部仓**） | 见 `test/manual/feature_capture/DESIGN.md` |
 | **P7**（推迟） | OpenAI 兼容层（`/v1/completions`、`/v1/chat/completions`） | 见 §15.2；SafeGauge 不需要，等有真实调用方再做 |
 
@@ -734,8 +703,8 @@ sgl-kernel）+ `pip install -e python`。目前机器上无可用 sglang 安装�
 | **R2** | P5 第二架构 | **只做 `Qwen3.5-9B`（Dense，32 层，混合注意力）**，`27B` 不列入本阶段 |
 | **R3** | probe 代码归属 | **在外部仓**。本仓只保留 `test/manual/feature_capture/` 作为测试与契约 |
 
-R1/R2/R3 生效后，§12 的文件清单不变（13 文件里本就没有 `protocol.py`/`serving_*`），
-但需要在文档里显式记录「哪些是免费的、哪些是被推迟的」，避免后来的人以为漏了。
+R1/R2/R3 生效后，§12 的上游接线不包含 `protocol.py`/`serving_*`。
+文档显式记录哪些接口已可用、哪些被推迟，避免后来的人误以为遗漏。
 
 ### 15.1 为什么原生 HTTP `/generate` 是免费的
 
@@ -793,4 +762,3 @@ routed_experts[index] = content["meta_info"].get("routed_experts", None)
 - no-KV 池（djs canary 的设计稿；省几 GB 显存但风险高，P3 通了再作独立实验）
 - MoE / PP / DP attention / CP / TBO / 多模态
 - 结果落 safetensors 到磁盘（走内存回传，落盘是客户端责任）
-

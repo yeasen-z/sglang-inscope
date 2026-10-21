@@ -155,12 +155,10 @@ djs 的问题正是反过来了——patch 是权威副本，代码只存在于 
 
 | commit | 内容 | 依赖 |
 |---|---|---|
-| `feature_capture: add request contract and row plan` | `spec.py`、`plan.py` + CPU 测试 | 无（不 import torch） |
-| `feature_capture: add capability gate and bridge` | `capabilities.py`、`bridge.py` | 上一个 |
-| `feature_capture: capture at layer boundaries` | `recorder.py`、`transport.py`、`encoding.py` + 13 文件改动 | 前两个 |
-| `feature_capture: expose meta_info["features"]` | 传输与响应 | 上一个 |
-| `qwen3: declare feature-capture adapter` | 模型 3 行 | — |
-| `qwen35: declare feature-capture adapter` | 模型 3 行（P5） | — |
+| `feature_capture: add core contracts and recorder` | `feature_capture/` 全部通用模块与对应单测 | 无 |
+| `feature_capture: wire request-scoped runtime path` | Engine/IPC/Req/ForwardBatch/ModelRunner/auxiliary output 接线与 request 测试 | 上一个 |
+| `feature_capture: add Qwen3 model adapters` | Qwen3、Qwen3.5、language-model-only 配置与真实模型验收脚本 | 前两个 |
+| `docs: record feature-capture validation and workflow` | InScope 设计、交接、环境脚本与手工测试文档 | 前三个 |
 
 **模型适配单独成 commit**，因为它是最可能与上游冲突的部分；
 单独成 commit 意味着如果某个模型文件被上游大改，可以只丢掉那个 commit 重写，

@@ -460,6 +460,7 @@ class Engine(EngineScoreMixin, EngineBase):
         return_hidden_states: Union[
             ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
         ] = False,
+        feature_capture: Optional[Union[Dict, List[Optional[Dict]]]] = None,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         stream: bool = False,
@@ -505,6 +506,7 @@ class Engine(EngineScoreMixin, EngineBase):
             custom_logit_processor=custom_logit_processor,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
+            feature_capture=feature_capture,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
             stream=stream,
@@ -575,6 +577,7 @@ class Engine(EngineScoreMixin, EngineBase):
         return_hidden_states: Union[
             ReturnHiddenStatesMode, List[ReturnHiddenStatesMode]
         ] = False,
+        feature_capture: Optional[Union[Dict, List[Optional[Dict]]]] = None,
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         stream: bool = False,
@@ -619,6 +622,7 @@ class Engine(EngineScoreMixin, EngineBase):
             lora_path=lora_path,
             require_reasoning=require_reasoning,
             return_hidden_states=return_hidden_states,
+            feature_capture=feature_capture,
             return_routed_experts=return_routed_experts,
             routed_experts_start_len=routed_experts_start_len,
             stream=stream,

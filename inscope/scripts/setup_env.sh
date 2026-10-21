@@ -6,8 +6,8 @@
 # machine-specific is an env var with a default.
 #
 # Notes:
-# - No `cargo`/`nvcc` needed: the CUDA pyproject declares no
-#   [tool.sglang] rust-extensions, so setup.py never calls cargo metadata.
+# - Rust extensions are disabled explicitly. setup.py otherwise discovers the
+#   repository's rust workspace and requires cargo even for an editable install.
 # - We install torch FIRST and then use --no-build-isolation, otherwise pip's
 #   PEP 517 build env downloads a second full copy of torch (build-system
 #   requires torch==2.14.1).
@@ -24,10 +24,12 @@ PY_VERSION="${PY_VERSION:-3.12}"
 PIP_INDEX="${PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 PIP_HOST="${PIP_HOST:-pypi.tuna.tsinghua.edu.cn}"
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+export SGLANG_BUILD_RUST_EXTS="${SGLANG_BUILD_RUST_EXTS:-none}"
 
 echo "== repo:  $REPO_ROOT"
 echo "== env:   $ENV_PREFIX (python $PY_VERSION)"
 echo "== index: $PIP_INDEX"
+echo "== rust extensions: $SGLANG_BUILD_RUST_EXTS"
 
 if [[ ! -x "$ENV_PREFIX/bin/python" ]]; then
   "$CONDA_BIN" create -y -p "$ENV_PREFIX" "python=$PY_VERSION"

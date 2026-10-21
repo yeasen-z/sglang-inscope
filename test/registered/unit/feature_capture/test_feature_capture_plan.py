@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 from sglang.srt.feature_capture.plan import (
     build_entries,
+    build_slot_plan,
     group_by_slot,
     layout_slots,
 )
@@ -131,6 +132,23 @@ class TestRowMapping(CustomTestCase):
 
 
 class TestSlotLayout(CustomTestCase):
+    def test_complete_plan_skips_decode_and_batches_without_specs(self):
+        self.assertEqual(
+            build_slot_plan(
+                rids=["A"],
+                specs=[_spec([4], [3])],
+                extend_lens=None,
+                seq_lens=[4],
+            ),
+            (),
+        )
+        self.assertEqual(
+            build_slot_plan(
+                rids=["A"], specs=[None], extend_lens=[4], seq_lens=[4]
+            ),
+            (),
+        )
+
     def test_layers_are_grouped_and_disjoint(self):
         entries = build_entries(
             rids=["A", "B"],

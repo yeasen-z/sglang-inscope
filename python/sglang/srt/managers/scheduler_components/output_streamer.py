@@ -235,7 +235,7 @@ class SchedulerOutputStreamer:
 
     def is_request_level_customized_info_key(self, key: str) -> bool:
         """Whether a customized-info value is emitted once rather than token-sliced."""
-        return False
+        return key == "features"
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
