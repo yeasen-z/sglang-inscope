@@ -55,8 +55,13 @@ def _compute_enable_deep_gemm():
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
+# SM110 (Jetson Thor) shares the SM100 tcgen05 kernel family, and the SM100
+# block-FP8 kernel requires UE8M0 (power-of-two) scales: its SF packing kernel
+# traps on any FP32 scale whose sign/mantissa bits are non-zero
+# (deep_gemm/impls/smxx_layout.cuh). So SM110 must request UE8M0 scales and the
+# weight requant, exactly like SM100.
 DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
-    get_platform().is_sm100 or get_device_sm() in (120, 121)
+    get_platform().is_sm100 or get_device_sm() in (110, 120, 121)
 )
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
