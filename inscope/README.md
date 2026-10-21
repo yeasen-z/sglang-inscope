@@ -27,6 +27,19 @@ SGLANG_BUILD_RUST_EXTS=none \
   python -m pip install --no-build-isolation -e ./python
 ```
 
+在 Jetson / Thor（aarch64）上改用 `setup_env_thor.sh`：那里没有 sudo 和
+`/opt` 前缀，且 pip 在该网络下会卡住，所以用 `uv` 解析。所有机器相关路径都是
+可覆盖的环境变量（conda 位置自动发现，仓库根从脚本位置推导），不含任何个人路径。
+
+```bash
+bash inscope/scripts/setup_env_thor.sh
+```
+
+该脚本还会提示一个 Thor 特有的坑：`CUDA_HOME` 必须同时能解析到
+`bin/nvcc` 和 `include/curand_kernel.h`——这两个文件在本机常分属不同位置
+（一个 CUDA 安装 + 一个 pip `nvidia-*` 包），缺任何一个都会在编译期或
+运行时 JIT 阶段以不同形式失败。
+
 ### 2. 提取最后一个 prompt token 的多层特征
 
 `SGLANG_ENABLE_FEATURE_CAPTURE` 要在 import/Engine 启动前设置，因为 scheduler
@@ -137,6 +150,38 @@ curl http://127.0.0.1:30000/generate \
 - 当前交付面是 Python `Engine.generate()` 和原生 `/generate`；不包含 OpenAI
   `/v1/chat/completions` 或 `/v1/completions` 的 features 字段。
 
+## Thor / SM110 上的 DeepGEMM FP8
+
+分支 `feat/deepgemm_sm110_thor` 让 SM110（NVIDIA Jetson Thor）能用上 DeepGEMM
+的 block-FP8 内核，而不是被强制退回 Triton。**需要两半同时到位**：
+
+1. **DeepGEMM 侧**：`DeepGEMM-SM110` 构建出的 `_C.so`——它把 host 侧 dispatch 的
+   `arch_major == 10` 扩成 `10 or 11`，使 SM110 落到既有 SM100 tcgen05 内核族。
+   设备内核仍由 DeepJIT 在运行时编译（`--gpu-architecture=sm_110f`），
+   `jit.hpp` 无需改动。
+2. **本仓两处改动**（commit `deepgemm: route SM110 (Thor) through the SM100 FP8 path`）：
+   - `deep_gemm_wrapper/configurer.py`：`DEEPGEMM_SCALE_UE8M0` 的判定加入 SM110。
+     SM100 族 block-FP8 的 SF 打包内核要求 scale 是非负 2 的幂
+     （`deep_gemm/impls/smxx_layout.cuh` 里的 device assert），传寻常 FP32 scale 会
+     触发 CUDA 719。SM110 与 SM100 共用该内核，所以必须同样请求 UE8M0 并做权重 requant。
+   - `quantization/fp8_utils.py`：原来 `backend == "auto"` 时对 SM110 **无条件**
+     降级到 `triton`，使 DeepGEMM 路径不可达。改为仅当 UE8M0 未启用时才降级。
+
+启用：
+
+```bash
+export SGLANG_ENABLE_JIT_DEEPGEMM=1
+```
+
+**失败模式是响亮的**：若只装本仓改动而 `_C.so` 仍是原版，会直接抛
+`RuntimeError: Assertion error (csrc/apis/gemm.hpp:225): Unsupported architecture`，
+不会静默算错。
+
+性能（PrefillBench 真实数据，**仅 prefill 阶段、41 条请求 / 1.44 M token**）：
+DeepGEMM **5,331 tok/s** vs Triton 3,639 tok/s，即 **1.47x**；
+短请求（~4k）2.21x。注意这是截断到 24/36 层的 prefill 测量，绝对值不代表全模型吞吐，
+但后端之间的比值有效。
+
 ## 测试
 
 CPU 契约和运行时回归：
@@ -191,6 +236,7 @@ SGLANG_CACHE_DIR=/tmp/sglang-inscope-cache \
 - [x] P3 多层 / 多位置 / 混合 batch / chunked / 缓存命中 / 并发 / 普通生成回归
 - [x] P4 `generate+features`：生成 token/text 与普通生成一致，仍只采 prompt
 - [x] P5 第二架构 `Qwen3.5-9B`（Dense text tower）证明解耦：单/多位置与 generate+features 真实 GPU 通过
+- [x] **Thor/SM110 DeepGEMM FP8**（分支 `feat/deepgemm_sm110_thor`）：配合 `DeepGEMM-SM110` 的 `_C.so` 走通，prefill 实测比 Triton 快 1.47x（短请求 2.21x）
 - [ ] P6 SafeGauge 式探测实验（外部仓）
 - [ ] P7（推迟）OpenAI 兼容层
 
