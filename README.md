@@ -1,5 +1,9 @@
 # SGLang: Fast inference for LLMs and multimodal models
 
+> **InScope fork:** this repository adds request-scoped, multi-layer hidden-feature
+> capture for Qwen3/Qwen3.5 without changing ordinary generation behavior.
+> See the [InScope overview and quick start](inscope/README.md) before using this fork.
+
 <p align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="SGLang" width="400">
 </p>

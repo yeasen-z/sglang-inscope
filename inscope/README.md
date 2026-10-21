@@ -1,10 +1,155 @@
 # InScope（观心）
 
-在 SGLang fork 上加一条**一等公民的特征提取通路**：一次 prefill，
-在指定 token 位置、指定多层上取 block 输出残差流（final norm 之前的表示），
-用于安全探测（SafeGauge 式：同段落上下文，对多个风险假设分别做 last-token 探测）。
+InScope 是一个 SGLang fork：在正常生成接口上增加请求级 `feature_capture`，
+可在一次 prompt prefill 中提取指定 token 位置、指定多层的 residual-stream
+block output。主要用于 SafeGauge 式的表征分析和 probe 实验。
+
+普通请求不会创建 feature plan、特征缓冲或 D2H 传输；该功能默认关闭，
+必须通过环境变量显式开启。
 
 基线 `sglang-inscope@main` = `92580581da`，上游 `yeasen-z/sglang-inscope`。
+
+## 快速开始
+
+### 1. 安装当前 fork
+
+推荐以 editable 模式安装，修改源码后无需重新打包：
+
+```bash
+cd /path/to/sglang-inscope
+bash inscope/scripts/setup_env.sh
+```
+
+脚本默认使用 `/opt/miniconda3/envs/inscope`。已有环境也可以直接安装：
+
+```bash
+SGLANG_BUILD_RUST_EXTS=none \
+  python -m pip install --no-build-isolation -e ./python
+```
+
+### 2. 提取最后一个 prompt token 的多层特征
+
+`SGLANG_ENABLE_FEATURE_CAPTURE` 要在 import/Engine 启动前设置，因为 scheduler
+子进程会在启动时读取它。
+
+```python
+import os
+
+os.environ["SGLANG_ENABLE_FEATURE_CAPTURE"] = "1"
+
+import sglang as sgl
+
+engine = sgl.Engine(
+    model_path="/path/to/Qwen3-8B",
+    tp_size=1,
+    disable_cuda_graph=True,
+)
+
+try:
+    result = engine.generate(
+        prompt="Explain why the sky is blue.",
+        sampling_params={"max_new_tokens": 0},
+        feature_capture={
+            "layers": [0, 20, -1],
+            "positions": {"mode": "last"},
+            "encoding": "float_list",
+        },
+    )
+    records = result["meta_info"]["features"]
+    for record in records:
+        print(record["layer"], record["positions"], record["shape"])
+finally:
+    engine.shutdown()
+```
+
+`max_new_tokens=0` 表示只做 prefill 并返回特征。若设为正整数，同一个请求会
+同时返回正常生成结果和 prompt 特征。
+
+### 3. input + gauge suffix
+
+把 gauge 语句拼到输入末尾，再用 `suffix_last` 锁定它的最后一个 token。
+如果分词后找不到 suffix，请求会报错，不会静默退化到 prompt 末尾。
+
+```python
+context = "The user asks for instructions that may be unsafe."
+gauge = "\nRisk assessment:"
+
+result = engine.generate(
+    prompt=context + gauge,
+    sampling_params={"max_new_tokens": 0},
+    feature_capture={
+        "layers": [8, 16, -1],
+        "positions": {
+            "mode": "suffix_last",
+            "suffix_text": gauge,
+        },
+        "encoding": "base64",
+    },
+)
+```
+
+### 4. 原生 HTTP `/generate`
+
+```bash
+SGLANG_ENABLE_FEATURE_CAPTURE=1 \
+python -m sglang.launch_server \
+  --model-path /path/to/Qwen3-8B \
+  --tp-size 1 \
+  --disable-cuda-graph
+
+curl http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Explain why the sky is blue.",
+    "sampling_params": {"max_new_tokens": 0},
+    "feature_capture": {
+      "layers": [0, 20, -1],
+      "positions": {"mode": "last"},
+      "encoding": "float_list"
+    }
+  }'
+```
+
+### 5. 请求契约
+
+| 字段 | 含义 |
+|---|---|
+| `layers` | 必填，最多 8 层；`-1` 是最后 block 的 pre-final-norm 输出 |
+| `site` | 可选，v1 仅支持 `block_output` |
+| `positions.mode` | `last`、`explicit`、`suffix_last` 或 `all` |
+| `positions.index` | `explicit` 模式的 token 位置列表，支持 Python 式负索引 |
+| `positions.suffix_text` | `suffix_last` 模式由 SGLang tokenizer 编码的文本 |
+| `positions.suffix_token_ids` | 调用方已分词时可直接传 token ids |
+| `encoding` | `base64`（默认，保留原 dtype 字节）或 `float_list`（方便调试） |
+
+结果位于 `result["meta_info"]["features"]`，每层一条 record，包含
+`schema_version` / `layer` / `site` / `positions` / `dtype` / `shape` /
+`encoding` / `data`。默认 base64 的解码参考
+[`test_qwen3_hidden_layer.py`](../test/manual/feature_capture/test_qwen3_hidden_layer.py)。
+
+## 已验证范围与限制
+
+- 已验证：Qwen3-8B BF16、Qwen3-8B-FP8、Qwen3.5-9B Dense text tower。
+- Qwen3.5 顶层 checkpoint 需用 `language_model_only=True`；v1 不接受视觉输入。
+- 已验证配置为 CUDA、TP=1、PP=1；DP attention、CP、TBO、speculative decoding、
+  disaggregation、multimodal 和 split prefill 会 fail fast。
+- capture 请求不走 CUDA graph；chunked prefill 和 radix cache 已有真实 GPU 验证。
+- 当前交付面是 Python `Engine.generate()` 和原生 `/generate`；不包含 OpenAI
+  `/v1/chat/completions` 或 `/v1/completions` 的 features 字段。
+
+## 测试
+
+CPU 契约和运行时回归：
+
+```bash
+SGLANG_CACHE_DIR=/tmp/sglang-inscope-cache \
+  /opt/miniconda3/envs/inscope/bin/python -m pytest -q \
+  test/registered/unit/feature_capture \
+  test/registered/unit/managers/test_output_streamer_customized_info.py
+```
+
+真实 GPU/HF 数值对照和 P3–P5 验收参见
+[`test/manual/feature_capture/README.md`](../test/manual/feature_capture/README.md)。
 
 ## 目录
 
