@@ -62,6 +62,11 @@ sglang-kernel：0.4.10
 sglang：当前仓库 python/ 的 editable 安装
 ```
 
+aarch64 / Jetson（Thor）上用 `inscope/scripts/setup_env_thor.sh`：无 sudo、
+无 `/opt` 前缀、用 `uv` 替代 pip，且需注意 `CUDA_HOME` 要同时解析到
+`bin/nvcc` 与 `include/curand_kernel.h`。SM110 上的 DeepGEMM FP8 支持见
+[`README.md` 的 Thor / SM110 一节](README.md#thor--sm110-上的-deepgemm-fp8)。
+
 editable 安装必须设置 `SGLANG_BUILD_RUST_EXTS=none`，否则 `setup.py` 会发现
 仓库内 Rust workspace 并要求安装 cargo。
 
