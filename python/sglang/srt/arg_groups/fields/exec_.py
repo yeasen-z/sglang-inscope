@@ -42,7 +42,7 @@ class ExecFeatures(msgspec.Struct):
         Optional[List[int]],
         Arg(
             help="Native feature boundary layers captured by dedicated prefill CUDA graphs. "
-            "Requires SGLANG_ENABLE_FEATURE_CAPTURE=1 and breakable/full prefill graphs. "
+            "Requires SGLANG_ENABLE_FEATURE_CAPTURE=1 and breakable prefill graphs. "
             "Positions remain request-scoped; requests outside these layers use eager execution.",
             nargs="+",
         ),

@@ -231,7 +231,8 @@ engine = sglang.Engine(
 
 仅层集合固定；位置、RID 和编码仍取自每次请求的原生 `feature_capture`。
 静态索引在 replay 前更新，返回张量在 replay 后复制到独立的紧凑缓冲，
-不暴露 padding 或下一次 replay 可覆盖的存储。支持 breakable/full backend；
+不暴露 padding 或下一次 replay 可覆盖的存储。当前仅开放经过真实模型数值验证的 breakable backend；full 路径的长输入
+特征数值尚不一致，因此拒绝启用。
 普通请求、生成请求及层集合之外的请求走 eager。默认服务不配置这些图层时，
 普通请求保留原有 graph 路径，不分配特征缓冲。
 

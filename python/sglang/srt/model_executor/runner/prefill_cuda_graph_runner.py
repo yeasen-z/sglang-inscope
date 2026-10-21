@@ -356,9 +356,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.feature_graph_layers = ()
         self.feature_graph_recorders: dict[int, GraphFeatureCaptureRecorder] = {}
         if graph_layers:
-            if self.prefill_backend_name not in (Backend.BREAKABLE, Backend.FULL):
+            if self.prefill_backend_name != Backend.BREAKABLE:
                 raise ValueError(
-                    "feature capture graphs require breakable/full prefill backend"
+                    "feature capture graphs require the numerically verified breakable backend"
                 )
             graph_spec = validate_feature_capture(
                 {"layers": graph_layers, "positions": {"mode": "last"}},

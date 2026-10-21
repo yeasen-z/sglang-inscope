@@ -1279,12 +1279,9 @@ class ModelRunner:
                 )
             from sglang.srt.model_executor.cuda_graph_config import Backend
 
-            if get_exec().graph.cuda_graph_config.prefill.backend not in (
-                Backend.BREAKABLE,
-                Backend.FULL,
-            ):
+            if get_exec().graph.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
                 raise ValueError(
-                    "feature capture graphs require breakable/full prefill backend"
+                    "feature capture graphs require the numerically verified breakable backend"
                 )
         if not is_enabled():
             return
