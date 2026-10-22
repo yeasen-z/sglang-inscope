@@ -20,6 +20,9 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.feature_capture.capabilities import (
+    is_enabled as feature_capture_enabled,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -65,6 +68,22 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+
+
+def _use_raw_prefill_kv(*, use_mla: bool) -> bool:
+    """Only full prefill workloads may bypass all paged KV reads and writes."""
+    return (
+        (
+            get_model().is_embedding
+            or (
+                get_schedule().prefill_only_disable_kv_cache
+                and feature_capture_enabled()
+            )
+        )
+        and get_schedule().chunked_prefill_size == -1
+        and get_memory().disable_radix_cache
+        and not use_mla
+    )
 
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
@@ -356,7 +375,7 @@ class FlashAttentionBackend(AttentionBackend):
         # block-schedule cache (see forward_extend rel_bias handling).
         self.full_cg_prefill_metadata = None
 
-        # In embedding mode with no chunked prefill and radix cache disabled,
+        # In embedding or dedicated native feature-only mode without cache reuse,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V
         # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
         # Restricted to non-MLA backends: the read-skip elif lives inside the
@@ -364,12 +383,7 @@ class FlashAttentionBackend(AttentionBackend):
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
-        self.fa_skip_kv_cache = (
-            get_model().is_embedding
-            and get_schedule().chunked_prefill_size == -1
-            and get_memory().disable_radix_cache
-            and not self.use_mla
-        )
+        self.fa_skip_kv_cache = _use_raw_prefill_kv(use_mla=self.use_mla)
 
         # Skip the FA3 scheduler_metadata precompute (PR #21104) when distributed
         # attention modes can change live cache_seqlens/num_splits across ranks.

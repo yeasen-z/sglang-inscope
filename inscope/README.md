@@ -260,3 +260,46 @@ SGLANG_CACHE_DIR=/tmp/sglang-inscope-cache \
 - [x] **Thor/SM110 DeepGEMM FP8**（分支 `feat/deepgemm_sm110_thor`）：配合 `DeepGEMM-SM110` 的 `_C.so` 走通，prefill 实测比 Triton 快 1.47x（短请求 2.21x）。详见[根 README §3.5](../README.md)
 - [ ] P6 SafeGauge 式探测实验（外部仓）
 - [ ] P7（推迟）OpenAI 兼容层
+
+## 专用 feature-only prefill
+
+`max_new_tokens=0` 的纯特征请求跳过 vocabulary projection；请求 logprob、
+scoring、grammar 或 hidden-state 输出时保留原有 logits 路径。所有 decoder
+层仍正常执行，层边界定义不变。
+
+启用专用图时，在 `SGLANG_ENABLE_FEATURE_CAPTURE=1` 下创建 Engine：
+
+```python
+engine = sglang.Engine(
+    model_path=model_path,
+    feature_capture_graph_layers=[8, 16, 24],
+    cuda_graph_config={
+        "decode": {"backend": "disabled"},
+        "prefill": {"backend": "breakable", "bs": [64, 128, 256], "max_bs": 256},
+    },
+)
+```
+
+仅层集合固定；位置、RID 和编码仍取自每次请求的原生 `feature_capture`。
+静态索引在 replay 前更新，返回张量在 replay 后复制到独立的紧凑缓冲，
+不暴露 padding 或下一次 replay 可覆盖的存储。当前仅开放经过真实模型数值验证的 breakable backend；full 路径的长输入
+特征数值尚不一致，因此拒绝启用。
+普通请求、生成请求及层集合之外的请求走 eager。默认服务不配置这些图层时，
+普通请求保留原有 graph 路径，不分配特征缓冲。
+
+Qwen3 FA3/FA4 还可使用已有 `prefill_only_disable_kv_cache=True`，同时设置
+`disable_radix_cache=True, chunked_prefill_size=-1`。生成模型的此模式要求开启
+原生 feature capture，只接受显式 `feature_capture`、`max_new_tokens=0`。
+现有 embedding 模式及 dtype/pool/backend 限制不变；不支持 hybrid/Mamba。
+专用 no-KV HTTP 服务应跳过通用生成 warmup，并使用不生成 token 的健康检查。
+
+输入长度仍严格校验；输出预算由 scheduler 截至剩余上下文，输入不截断。
+
+CPU 回归位于 `test/registered/unit/feature_capture/`；独立 CUDA 索引重放与
+输出所有权检查：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python test/manual/feature_capture/test_graph_recorder_cuda.py
+```
+
+完整模型数值验证仍需运行手工验收。上述小型 CUDA 检查不代替模型验收。
