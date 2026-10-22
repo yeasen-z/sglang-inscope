@@ -9,31 +9,60 @@
 > 本项目是 [sgl-project/sglang](https://github.com/sgl-project/sglang) 的 fork，
 > 遵循 Apache-2.0。
 >
-> 快速上手：[`inscope/README.md`](inscope/README.md) ｜
-> 交接入口：[`inscope/handoff.md`](inscope/handoff.md) ｜
+> 安装与接口：[`inscope/README.md`](inscope/README.md)（[安装](inscope/README.md#1-安装) ｜
+> [接口](inscope/README.md#2-接口)）｜ 交接入口：[`inscope/handoff.md`](inscope/handoff.md) ｜
 > 详细设计：[`inscope/design/`](inscope/design/)
 
 ---
 
-## 1. 实现了什么
+## 1. 功能清单
 
-在**既有生成接口**上增加一个一等字段 `feature_capture`。开启后，一次请求可以：
+本 fork 在上游 SGLang 上加了两类能力。普通生成请求的行为不变。
 
-- **多层**：默认单请求最多 8 层，跨整个 residual stream；
-- **多位置**：`last` / `explicit` / `suffix_last` / `all` 四种模式；
-- **两种产出**：只做 prefill 只返回特征（`max_new_tokens=0`），或「文本 + 特征」同时返回；
-- **零拷贝编码**：按模型 dtype 的原始字节 + base64 回传，避免转换失真与体积膨胀。
+### 1.1 请求级多层特征采集
 
-入口有三条，共用同一套校验与通路：
+一次 prompt prefill 取回指定层、指定 token 位置的 residual-stream 隐藏状态。
+用于 SafeGauge 式表征分析和 probe。**默认关闭**，进程启动前设
+`SGLANG_ENABLE_FEATURE_CAPTURE=1`。关闭时不建 plan、不分配缓冲、不做 D2H；
+请求里带了 `feature_capture` 会被拒绝，不是静默丢掉。
 
-| 入口 | 说明 |
-|---|---|
-| `Engine.generate(..., feature_capture=...)` | 主要交付面 |
-| 原生 HTTP `/generate` | 复用上面对话协议，`meta_info` 原样透出，无需额外代码 |
-| `prefill_only` 模式 | `max_new_tokens=0`，跳过 decode / 采样 / logits |
+没有新的 HTTP 路径。字段挂在既有接口上：
 
-**默认关闭。** `SGLANG_ENABLE_FEATURE_CAPTURE=0` 时不创建 feature plan、不分配
-特征缓冲、不做任何 D2H 传输——关闭路径上不存在为采集准备的对象。
+| 功能 | 状态 | 入口 |
+|---|---|---|
+| 多层采集，默认单请求最多 8 层，`L ∈ [0, N]`，`-1` 是最后一层 pre-final-norm | 已交付 | `feature_capture.layers` |
+| 位置：`last` / `explicit`（含负索引）/ `suffix_last` / `all` | 已交付 | `feature_capture.positions` |
+| `suffix_last` 找不到 gauge 就报错，不退化成 `last` | 已交付 | 同上 |
+| 只采特征，跳过 decode / 采样；纯特征还跳过 vocabulary projection | 已交付 | `max_new_tokens=0` |
+| 同一次请求返回文本和 prompt 特征 | 已交付 | `max_new_tokens>0` + `feature_capture` |
+| 编码：`base64`（原 dtype 字节）或 `float_list`（调试） | 已交付 | `feature_capture.encoding` |
+| Python：`Engine.generate` / `async_generate` | 已交付 | 关键字 `feature_capture=`，结果在 `meta_info["features"]` |
+| HTTP：原生 `POST /generate` | 已交付 | JSON 字段 `feature_capture`，同样从 `meta_info` 取回 |
+| 专用 prefill CUDA graph，只覆盖固定层集合 | 已交付，需显式配置 | `feature_capture_graph_layers` + prefill backend `breakable` |
+| Qwen3 FA3/FA4 纯特征请求不分配物理 KV | 已交付，有前置条件 | `--prefill-only-disable-kv-cache` |
+| 多模态 checkpoint 只加载语言塔 | 已交付 | `--language-model-only`；不接受图像 |
+| OpenAI `/v1/chat/completions`、`/v1/completions` | **不做** | 探测走上面两个入口 |
+| SafeGauge probe 实验本身 | **不在本仓** | 外部仓，P6 |
+
+已适配模型：`Qwen3`、`Qwen3.5` 文本塔。已验证：Qwen3-8B BF16、Qwen3-8B-FP8、
+Qwen3.5-9B。运行时只接受 CUDA、TP=1、PP=1 的文本请求；DP attention、CP、TBO、
+speculative、disaggregation、multimodal、split prefill、MoE 采集和 decode 阶段
+采集会直接拒绝。
+
+### 1.2 SM110（Jetson Thor）上的 DeepGEMM FP8
+
+**只影响 Thor。** 其它架构仍用 PyPI 的 `sgl-deep-gemm==0.2.3`，也不会走进这段探测。
+
+| 功能 | 状态 | 说明 |
+|---|---|---|
+| 启动时探测已装 DeepGEMM 是否真能跑 SM110 | 已交付 | 问 `_C.so` 的 `supported_arch_majors()`，老构建再看 `+sm110` |
+| 探测失败回退 Triton FP8，并打 warning | 已交付 | 不在第一个请求崩掉，也不静默算错 |
+| SM110 走 SM100 的 UE8M0 scale 要求 | 已交付 | 否则 block-FP8 的 SF 打包会触发 CUDA 719 |
+| 安装脚本：release wheel 优先，失败再源码构建 | 已交付 | `inscope/scripts/setup_deepgemm.sh`；非 SM110 直接退出 |
+| 不装 fork 也能跑 | 已交付 | 自动走 Triton，prefill 实测慢约 1.47x |
+
+原理、`CUDA_HOME` 要求和实测数据见 [§3.5](#35-sm110jetson-thor-的-deepgemm-适配)；
+安装步骤见 [`inscope/README.md` §1.2](inscope/README.md#12-装-deepgemm-sm110仅-thor)。
 
 ---
 
@@ -129,6 +158,10 @@ split prefill、MoE 采集，以及 decode 阶段的采集。已验证配置为 
 
 ### 3.5 SM110（Jetson Thor）的 DeepGEMM 适配
 
+> 安装：`bash inscope/scripts/setup_deepgemm.sh`（仅 Thor，见
+> [`inscope/README.md` §1.2](inscope/README.md#12-装-deepgemm-sm110仅-thor)）。
+> 本节只讲原理和验证数据。
+
 DeepGEMM 原本在 SM110 上不可用，会被强制退回 Triton。本 fork 让它走通：
 
 - **DeepGEMM 侧**：需要 `DeepGEMM-SM110` 构建出的 `_C.so`——把 host 侧
@@ -169,7 +202,6 @@ DeepGEMM 原本在 SM110 上不可用，会被强制退回 Triton。本 fork 让
 5,331 tok/s vs Triton 3,639 tok/s，即 **1.47x**；短请求（~4k）**2.21x**。
 截断层次意味着绝对值不代表全模型吞吐，但后端比值有效。
 
-详细步骤见 [`inscope/README.md`](inscope/README.md)；
 对 `DeepGEMM-SM110` 的改进诉求见
 [`inscope/suggestion_and_require.md`](inscope/suggestion_and_require.md)。
 
@@ -177,12 +209,22 @@ DeepGEMM 原本在 SM110 上不可用，会被强制退回 Triton。本 fork 让
 
 ## 4. 快速开始
 
+脚本不创建环境，也不查找 conda。先自己准备 Python 3.11+ 并激活，再装当前 checkout。
+
 ```bash
 git clone git@github.com:yeasen-z/sglang-inscope.git
 cd sglang-inscope
-source /path/to/env/bin/activate           # 任选 uv / venv / conda，脚本不建环境
+source /path/to/env/bin/activate           # uv / venv / conda 均可
 bash inscope/scripts/setup_env.sh          # x86 与 aarch64 同一份脚本
 ```
+
+Jetson Thor 还要显式设置 `CUDA_HOME`，并在 `setup_env.sh` 之后跑
+`inscope/scripts/setup_deepgemm.sh`。**只有 SM110 需要第二步**；H100 / A100 /
+B200 等机器停在 `setup_env.sh` 即可，PyPI 的 `sgl-deep-gemm==0.2.3` 就是对的。
+脚本在非 SM110 上会说明原因后退出，不会去构建。
+
+接口字段、四种位置、返回解码和 HTTP 示例见
+[`inscope/README.md` §2](inscope/README.md#2-接口)。这里只给最短的一条：
 
 ```python
 import os

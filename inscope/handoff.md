@@ -30,7 +30,7 @@ probe 的高 AUROC 只能说明表示中存在可利用信号，不等于模型�
 
 - 远端 workspace：`/DATA/disk2/workspace/zmosg/sglang-inscope`
 - Git remote：`https://github.com/yeasen-z/sglang-inscope.git`
-- 当前基线：`main@e898054d`（与 `origin/main` 一致）
+- 功能基线：已合入 `origin/main@38ea8d30`（本地 `main` 指针仍停在 `e898054d`，落后远端）
 - 当前状态：P0–P5 已完成并在真实 GPU 验证；生产推理链路尚未接入 feature capture。
   SM110 / Thor 的 DeepGEMM 适配在分支 `feat/deepgemm_sm110_thor`。
 
