@@ -342,6 +342,8 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+    # Native feature-only requests need no vocabulary projection.
+    feature_capture_only: bool = False
 
     # Carried from ForwardBatch so logits pruning can reconstruct the SP gather.
     attn_tp_sequence_sharded: bool = False
@@ -404,6 +406,18 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
+            feature_capture_only=(
+                forward_batch.is_prefill_only
+                and forward_batch.feature_capture_requested
+                and not forward_batch.return_logprob
+                and forward_batch.capture_hidden_mode == CaptureHiddenMode.NULL
+                and not forward_batch.return_pooled_hidden_states
+                and not forward_batch.return_hidden_states_before_norm
+                and (
+                    forward_batch.sampling_info is None
+                    or forward_batch.sampling_info.grammars is None
+                )
+            ),
             attn_tp_sequence_sharded=forward_batch.attn_tp_sequence_sharded,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
@@ -538,6 +552,15 @@ class LogitsProcessor(nn.Module):
         # means no autotune pass, which must not skip. Placed before the MIS /
         # DLLM / common dispatch so all three LM-head paths are skipped.
         if _autotune_run_lm_head is False:
+            return LogitsProcessorOutput(next_token_logits=None)
+
+        # Feature records are attached independently after the model forward.
+        # Keep scoring and hidden-state requests on their existing paths.
+        if (
+            logits_metadata.feature_capture_only
+            and multi_item_delimiter_indices is None
+            and token_indices_to_pool is None
+        ):
             return LogitsProcessorOutput(next_token_logits=None)
 
         # Under LayerNorm SP the decoder loop leaves these sequence-sharded; undo
