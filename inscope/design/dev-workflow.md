@@ -89,7 +89,7 @@ sglang-activation-runtime/
 | | djs | zyt | 我们 |
 |---|---|---|---|
 | 有自己控制的 fork 吗 | 没有（改别人的部署环境） | 没有（保护既有安装） | **有**：`yeasen-z/sglang-inscope` |
-| 仓库状态 | — | — | `main@92580581da`，**pristine 上游，无自定义 commit** |
+| 仓库状态 | — | — | `main@e898054d`，InScope 实现已合入 `main` |
 | 运行时从哪来 | 打补丁的 wheel | 影子 `.source` | **fork 本身**，`pip install -e python` |
 | 要保护的既有安装 | 无 | 有 | **无**（新环境 `/opt/miniconda3/envs/inscope`） |
 
@@ -108,7 +108,7 @@ sglang-activation-runtime/
 
 ```bash
 cd /DATA/disk2/workspace/zmosg/sglang-inscope
-git checkout -b feat/inscope            # 从 92580581da 切出
+git checkout -b feat/inscope            # 从 main 切出
 ```
 
 - **开发**：直接在 `python/sglang/srt/feature_capture/` 写代码 + 改 13 个文件；
@@ -135,7 +135,7 @@ git apply --check --directory=. inscope/patches/feature-capture-<ver>.patch
 ```json
 {
   "base": {"repository": "https://github.com/yeasen-z/sglang-inscope",
-           "branch": "main", "commit": "92580581da6fc8542a997a00c1a8b71b03497680"},
+           "branch": "main", "commit": "e898054de23574866fa572b5bb65f073c5512544"},
   "patch": {"filename": "feature-capture-v1.patch", "sha256": "..."},
   "feature_capture_schema": "inscope.feature_capture.v1"
 }
@@ -148,7 +148,7 @@ djs 的问题正是反过来了——patch 是权威副本，代码只存在于 
 
 ## 4. 提交纪律（为了 rebase，不是为了好看）
 
-上游 sglang 的 `main` 每天在动。我们的 fork 现在钉在 `92580581da`（2026-10-16），
+上游 sglang 的 `main` 每天在动。我们的 fork 现在钉在 `e898054d`（2026-10-21），
 迟早要跟进。跟进成本完全由「改了多少既有文件」决定，所以：
 
 ### 4.1 分阶段提交，让每个 commit 可独立回退
@@ -206,15 +206,19 @@ python -m pytest test/registered/unit/feature_capture/ -q
 
 ## 5. 具体命令
 
-### 5.1 建环境（P0）
+### 5.1 装环境（P0）
+
+脚本**不创建**环境——先按上游约定准备并激活一个 Python 3.11+ 环境
+（`uv venv --python 3.12 && source .venv/bin/activate`，或任意 venv / conda）：
 
 ```bash
 bash inscope/scripts/setup_env.sh
-# 环境变量可覆盖：ENV_PREFIX / PIP_INDEX / PY_VERSION / REINSTALL
+# 可覆盖：PYTHON / UV / PIP / PIP_INDEX / REINSTALL / SGLANG_BUILD_RUST_EXTS
 ```
 
-已知的三处处理，写在脚本注释里：先装 torch 再 `--no-build-isolation`（否则下载两份 torch）；
-不需要 cargo/nvcc（CUDA 版 pyproject 不声明 rust-extensions）；用镜像。
+三处关键处理，写在脚本注释里：先装 torch 再 `--no-build-isolation`（否则隔离构建
+会下载两份 torch）；`SGLANG_BUILD_RUST_EXTS=none`（否则 `setup.py` 要求 cargo）；
+装完自检 fork 的 plumbing 可导入。
 
 ### 5.2 跑测试
 
