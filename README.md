@@ -1,124 +1,278 @@
-# SGLang: Fast inference for LLMs and multimodal models
+# InScope（观心）
 
-> **InScope fork:** this repository adds request-scoped, multi-layer hidden-feature
-> capture for Qwen3/Qwen3.5 without changing ordinary generation behavior.
-> See the [InScope overview and quick start](inscope/README.md) before using this fork.
+**在 SGLang 上增加请求级、多层 residual-stream 特征采集的 fork。**
 
-<p align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="SGLang" width="400">
-</p>
+一次 prompt prefill 就能取回指定 token 位置、指定层的隐藏状态，用于 SafeGauge
+式的表征分析与 probe 实验。普通请求的行为、性能与输出完全不变。
 
-<p align="center">
-  <a href="https://pypi.org/project/sglang/"><img src="https://img.shields.io/pypi/v/sglang?style=flat&amp;label=PyPI&amp;labelColor=555555&amp;color=orange" alt="PyPI version"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green?style=flat&amp;labelColor=555555" alt="License: Apache 2.0"></a>
-  <a href="https://pypistats.org/packages/sglang"><img src="https://img.shields.io/pypi/dm/sglang?style=flat&amp;label=Downloads&amp;labelColor=555555&amp;color=blue" alt="PyPI downloads per month"></a>
-</p>
-
-<p align="center">
-  <a href="https://docs.sglang.io/">Docs</a> |
-  <a href="https://cookbook.sglang.io/">Cookbook</a> |
-  <a href="https://www.sglang.io/">Website</a> |
-  <a href="https://lmsys.org/blog/">Blog</a> |
-  <a href="https://slack.sglang.io/">Slack</a>
-</p>
-
-SGLang is an open-source inference framework for large language, vision-language, and diffusion models, optimized for agentic workloads, large-scale serving, and RL rollouts. [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion) is its built-in image and video generation engine, included in this repository and the `sglang` Python package.
-
-👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
-
-> **[SGLang Summit 2026: Meet the builders of open AI](https://www.sglang.io/summit)**<br>
-> **Our flagship annual gathering · November 12–13 · San Francisco**
+> 上游 SGLang 的原始 README 保留在 [`README.upstream.md`](README.upstream.md)。
+> 本项目是 [sgl-project/sglang](https://github.com/sgl-project/sglang) 的 fork，
+> 遵循 Apache-2.0。
 >
-> Go deep on inference, training, and AI hardware through technical talks, live demos, and hands-on workshops. Bring your deployment challenges and meet the engineers and researchers building the stack.
+> 安装与接口：[`inscope/README.md`](inscope/README.md)（[安装](inscope/README.md#1-安装) ｜
+> [接口](inscope/README.md#2-接口)）｜ 交接入口：[`inscope/handoff.md`](inscope/handoff.md) ｜
+> 详细设计：[`inscope/design/`](inscope/design/)
 
-## Get Started
+---
 
-Pull the Docker image, which includes SGLang and its dependencies:
+## 1. 功能清单
 
-```bash
-docker pull lmsysorg/sglang:latest
+本 fork 在上游 SGLang 上加了两类能力。普通生成请求的行为不变。
+
+### 1.1 请求级多层特征采集
+
+一次 prompt prefill 取回指定层、指定 token 位置的 residual-stream 隐藏状态。
+用于 SafeGauge 式表征分析和 probe。**默认关闭**，进程启动前设
+`SGLANG_ENABLE_FEATURE_CAPTURE=1`。关闭时不建 plan、不分配缓冲、不做 D2H；
+请求里带了 `feature_capture` 会被拒绝，不是静默丢掉。
+
+没有新的 HTTP 路径。字段挂在既有接口上：
+
+| 功能 | 状态 | 入口 |
+|---|---|---|
+| 多层采集，默认单请求最多 8 层，`L ∈ [0, N]`，`-1` 是最后一层 pre-final-norm | 已交付 | `feature_capture.layers` |
+| 位置：`last` / `explicit`（含负索引）/ `suffix_last` / `all` | 已交付 | `feature_capture.positions` |
+| `suffix_last` 找不到 gauge 就报错，不退化成 `last` | 已交付 | 同上 |
+| 只采特征，跳过 decode / 采样；纯特征还跳过 vocabulary projection | 已交付 | `max_new_tokens=0` |
+| 同一次请求返回文本和 prompt 特征 | 已交付 | `max_new_tokens>0` + `feature_capture` |
+| 编码：`base64`（原 dtype 字节）或 `float_list`（调试） | 已交付 | `feature_capture.encoding` |
+| Python：`Engine.generate` / `async_generate` | 已交付 | 关键字 `feature_capture=`，结果在 `meta_info["features"]` |
+| HTTP：原生 `POST /generate` | 已交付 | JSON 字段 `feature_capture`，同样从 `meta_info` 取回 |
+| 专用 prefill CUDA graph，只覆盖固定层集合 | 已交付，需显式配置 | `feature_capture_graph_layers` + prefill backend `breakable` |
+| Qwen3 FA3/FA4 纯特征请求不分配物理 KV | 已交付，有前置条件 | `--prefill-only-disable-kv-cache` |
+| 多模态 checkpoint 只加载语言塔 | 已交付 | `--language-model-only`；不接受图像 |
+| OpenAI `/v1/chat/completions`、`/v1/completions` | **不做** | 探测走上面两个入口 |
+| SafeGauge probe 实验本身 | **不在本仓** | 外部仓，P6 |
+
+已适配模型：`Qwen3`、`Qwen3.5` 文本塔。已验证：Qwen3-8B BF16、Qwen3-8B-FP8、
+Qwen3.5-9B。运行时只接受 CUDA、TP=1、PP=1 的文本请求；DP attention、CP、TBO、
+speculative、disaggregation、multimodal、split prefill、MoE 采集和 decode 阶段
+采集会直接拒绝。
+
+### 1.2 SM110（Jetson Thor）上的 DeepGEMM FP8
+
+**只影响 Thor。** 其它架构仍用 PyPI 的 `sgl-deep-gemm==0.2.3`，也不会走进这段探测。
+
+| 功能 | 状态 | 说明 |
+|---|---|---|
+| 启动时探测已装 DeepGEMM 是否真能跑 SM110 | 已交付 | 问 `_C.so` 的 `supported_arch_majors()`，老构建再看 `+sm110` |
+| 探测失败回退 Triton FP8，并打 warning | 已交付 | 不在第一个请求崩掉，也不静默算错 |
+| SM110 走 SM100 的 UE8M0 scale 要求 | 已交付 | 否则 block-FP8 的 SF 打包会触发 CUDA 719 |
+| 安装脚本：release wheel 优先，失败再源码构建 | 已交付 | `inscope/scripts/setup_deepgemm.sh`；非 SM110 直接退出 |
+| 不装 fork 也能跑 | 已交付 | 自动走 Triton，prefill 实测慢约 1.47x |
+
+原理、`CUDA_HOME` 要求和实测数据见 [§3.5](#35-sm110jetson-thor-的-deepgemm-适配)；
+安装步骤见 [`inscope/README.md` §1.2](inscope/README.md#12-装-deepgemm-sm110仅-thor)。
+
+---
+
+## 2. 设计
+
+### 2.1 架构：三块拆分，模型侧只有一个函数名
+
+```
+feature_capture/  ← 通用运行时，模型无关（层号/位置/编码/传输全在这里）
+      ↑
+模型文件          ← 只声明 feature_capture_sites + 调一次 layer_capture(...)
+      ↑
+官方传输协议      ← DeviceAuxiliaryOutput → copy_to_host → consume（复用，不重写）
 ```
 
-Alternatively, install SGLang in an activated Python environment with uv:
+模型文件里**不认识**层号、token 位置、dtype、编码方式。加一个新模型 = 一行
+`layer_capture(...)` 调用 + 一行类属性声明。这条约束是可验收的：以「模型中不出现
+位置、编码、传输逻辑」为准，而不是以改动行数为准。
 
-```bash
-uv pip install --prerelease=allow sglang
+### 2.2 关键设计决策
+
+完整决策表（含被否方案与理由）见
+[`implementation-design.md` §0.2](inscope/design/implementation-design.md)。最影响
+正确性的几条：
+
+| 决策 | 选择 | 为什么不能选另一个 |
+|---|---|---|
+| **层号语义** | residual-stream block boundary，`L ∈ [0, N]`；`L < N` 与 HF `outputs.hidden_states[L]` 对齐 | 用 block 索引会让调用方手写 `+1`，且和 HF 语义错位 |
+| **最后一层** | `L = N`（或 `-1`）走 `final_norm(capture=)`，表示最后 block 的 **pre-final-norm** 输出 | 当前 Transformers 的 Qwen3 `hidden_states[N]` **已经过 final norm**，直接对齐会算错；HF golden 必须挂最后 block hook |
+| **采集点** | 挂基线已有的 `capture` 回调 | 手算 `hidden + residual` 会绕开融合 kernel 的 FP32 累加 |
+| **结果回传** | 复用 `DeviceAuxiliaryOutput`，挂在 `LogitsProcessorOutput.feature_device_output` | 直接塞 `auxiliary_device_output` 会被 `sample()` 开头清成 `None` |
+| **选行** | `torch.index_select` 到预分配输出 | 不需要 fused kernel：`capture` 给的 `value` 本就在显存，只产出小结果 |
+| **缓存边界** | 精确到「最早未采集位置」+ 已采位置集合 | 固定 margin（如 512）会白算最多 512 token，且不处理重算导致的重复采集 |
+| **结果编码** | 原始字节 + base64 | `.tolist()` 走 JSON 会让 4096 维 BF16 膨胀一个数量级并丢精度 |
+| **进程开关** | 默认关闭 | 总是开启会让所有用户为用不到的功能买单 |
+
+### 2.3 位置语义：`suffix_last` 是校验器，不是别名
+
+`positions.mode` 支持四档：
+
+- `last` —— 最后一个 prompt token
+- `explicit` —— 显式位置列表，支持 Python 式负索引
+- `suffix_last` —— 把 gauge 语句拼在输入末尾，锁定**它的最后一个 token**
+- `all` —— 全部位置
+
+`suffix_last` 若在分词后找不到 suffix，请求**报错**，不会静默退化成 `last`。
+SafeGauge 类实验依赖「采的确实是 gauge 位」，静默退化会让整批 probe 数据错而不自知。
+
+### 2.4 数值正确性
+
+不靠「看起来对」：
+
+- `L < N` 与 HF `outputs.hidden_states[L]` 对齐；`L = N` 用 block hook 作 HF 参考；
+- 缓存命中重放有专门用例（重算不能重复采集）；
+- FP8 与 BF16 的关系有专门用例，但**永不**断言两者逐位相等。
+
+---
+
+## 3. 兼容性
+
+### 3.1 对上游
+
+- 以 fork 分支为唯一真源，定期 `merge upstream main`，不靠 patch 文件流；
+  发布补丁只作导出物。流程见 [`dev-workflow.md`](inscope/design/dev-workflow.md)。
+- 不修改 `python/pyproject.toml` 的版本号或依赖，避免与上游持续冲突。
+- 不碰基线的 `capture_aux_hidden_states` / `layers_to_capture`。用开关 + `finally`
+  恢复的写法会在包装层与内层之间产生 tuple 解包不一致，并影响 EAGLE 采集。
+
+### 3.2 对既有用户
+
+| 场景 | 行为 |
+|---|---|
+| 不传 `feature_capture` | 与原生 SGLang 完全一致，无额外对象、无额外传输 |
+| 传了 `feature_capture` | 该请求不走 CUDA graph；采集行以 eager 执行 |
+| 未设 `SGLANG_ENABLE_FEATURE_CAPTURE` | 功能整体关闭，字段被拒绝而非静默忽略 |
+
+### 3.3 v1 明确不支持（fail fast，不静默降级）
+
+DP attention、CP、TBO、speculative decoding、disaggregation、multimodal、
+split prefill、MoE 采集，以及 decode 阶段的采集。已验证配置为 CUDA / TP=1 / PP=1。
+
+交付面只做 `Engine.generate()` 与原生 `/generate`；**不含** OpenAI 兼容层
+（`/v1/chat/completions`、`/v1/completions`），原因见设计文档 §15。
+
+### 3.4 已验证范围
+
+- 模型：Qwen3-8B BF16、Qwen3-8B-FP8、Qwen3.5-9B（Dense text tower，验证解耦）
+- Qwen3.5 的顶层 checkpoint 需用 `language_model_only=True` 加载；**v1 不接受视觉输入**
+- 场景：多层 / 多位置 / 混合 batch / chunked prefill / radix cache 命中 / 并发 /
+  `generate+features` 与普通生成一致性
+- 平台：x86 + CUDA 已在前面 P0–P5 验证；**Jetson Thor（aarch64 / SM110）**
+  的 DeepGEMM FP8 适配见下节
+
+### 3.5 SM110（Jetson Thor）的 DeepGEMM 适配
+
+> 安装：`bash inscope/scripts/setup_deepgemm.sh`（仅 Thor，见
+> [`inscope/README.md` §1.2](inscope/README.md#12-装-deepgemm-sm110仅-thor)）。
+> 本节只讲原理和验证数据。
+
+DeepGEMM 原本在 SM110 上不可用，会被强制退回 Triton。本 fork 让它走通：
+
+- **DeepGEMM 侧**：需要 `DeepGEMM-SM110` 构建出的 `_C.so`——把 host 侧
+  `arch_major == 10` 的 dispatch 扩到 `10 or 11`，使 SM110 落到既有 SM100
+  tcgen05 内核族。设备内核仍由 DeepJIT 运行时编译（`sm_110f`），无需改 `jit.hpp`。
+- **本仓侧**：两处改动——SM110 加入 UE8M0 scale 判定（SM100 族 block-FP8 的 SF
+  打包内核要求非负 2 的幂 scale，否则触发 CUDA 719）；以及不再对 SM110 无条件
+  降级到 `triton`。
+
+启用：`export SGLANG_ENABLE_JIT_DEEPGEMM=1`。
+
+**Thor 上 `CUDA_HOME` 必须显式设置**（这一条和上游文档的说法不同）：上游称
+`CUDA_HOME` 可选，会自动按 `$CUDA_HOME` → `PATH` 上的 `nvcc` → `/usr/local/cuda`
+三级回退。但 Thor 的 CUDA 来自 pip `nvidia-*` 包，实测三级**全部落空**：
+
+```text
+1) CUDA_HOME/CUDA_PATH : 未设
+2) PATH 上的 nvcc      : 无
+3) /usr/local/cuda     : 不存在
 ```
 
-Next, launch your model:
+所以 Thor 上要显式指向一个同时含 `bin/nvcc` 和 `include/curand_kernel.h` 的前缀，
+否则构建期报 `Cannot locate a CUDA installation`，或运行期 JIT 找不到设备头文件。
 
-- [Quickstart](https://docs.sglang.io/docs/get-started/quickstart): Run your first model and send a request.
-- [Cookbook](https://cookbook.sglang.io/): Choose your model and hardware to get a ready-to-run launch command.
+**能力探测，不是版本硬编码**：启动时会问当前装的 DeepGEMM 支不支持 SM110——
+优先用它的能力查询（`supported_arch_majors()` / `supports_arch()`，见
+[需求文档 R4](inscope/suggestion_and_require.md)），老版本回退到版本号里的
+`+sm110` 标记。**DeepGEMM 侧升级或改接口都不会让这里失效。**
 
-## Supported Hardware
+`supported_arch_majors()` 是最可信的信号——它直接读已编译的 `_C.so`，因此能识别
+「Python 侧是新的、`_C.so` 是旧的」这种错配；错配时该调用抛 `AttributeError`，
+探测会吞掉它并回退到版本号，不会让 SGLang 在 import 期崩掉。
 
-SGLang supports a wide range of GPUs, TPUs, NPUs, CPUs, and Apple Silicon platforms.
+探测到不支持时（例如 `_C.so` 仍是原版），**回退 Triton 并打一条 warning**，
+不会在第一个请求时崩掉，也不会静默算错。装对了才会启用 DeepGEMM。
 
-| Platform | Representative hardware |
-| --- | --- |
-| [NVIDIA](https://docs.sglang.io/docs/hardware-platforms/nvidia-gpus) | B200/B300/GB200/GB300; H100/H200/H800/H20; A100; RTX 30/40/50 series, RTX 6000 Ada / PRO 6000; DGX Spark, Jetson Orin |
-| [AMD](https://docs.sglang.io/docs/hardware-platforms/amd_gpu) | Instinct MI300X, MI325X, MI350X, MI355X |
-| [Google TPU](https://docs.sglang.io/docs/hardware-platforms/tpu) | v6e, v7; [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) / [SGL-JAX](https://github.com/sgl-project/sglang-jax) |
-| Intel ([GPU](https://docs.sglang.io/docs/hardware-platforms/xpu) / [CPU](https://docs.sglang.io/docs/hardware-platforms/cpu_server)) | Arc / Arc Pro B-Series GPUs, Xeon CPUs |
-| [Apple Silicon](https://docs.sglang.io/docs/hardware-platforms/apple_metal) | Macs via Metal / MLX |
-| [Huawei Ascend](https://docs.sglang.io/docs/hardware-platforms/ascend-npus/getting-started/installation) | A2, A3, 950PR/DT NPUs |
-| [Moore Threads](https://docs.sglang.io/docs/hardware-platforms/mthreads_gpu) | MTT S5000 GPUs |
+实测（PrefillBench 真实数据，**仅 prefill、41 请求 / 1.44 M token、24/36 层**）：
+5,331 tok/s vs Triton 3,639 tok/s，即 **1.47x**；短请求（~4k）**2.21x**。
+截断层次意味着绝对值不代表全模型吞吐，但后端比值有效。
 
-Integrations in progress: AWS Trainium, [Alibaba T-Head PPU](https://github.com/sgl-project/sglang/issues/37519), [Cambricon MLU](https://github.com/sgl-project/sglang/pull/26898), Qualcomm QAIC, MetaX, Hygon HCU/DCU, Iluvatar CoreX, and more.
+对 `DeepGEMM-SM110` 的改进诉求见
+[`inscope/suggestion_and_require.md`](inscope/suggestion_and_require.md)。
 
-SGLang-TorchTPU brings the SGLang serving engine to Google TPUs through PyTorch, torch_tpu, and Pallas kernels. It supports LLM and vision-language serving on TPU7x (Ironwood), including tensor and expert parallelism across hosts. SGL-JAX provides the JAX-based TPU serving path.
+---
 
-See the [Cookbook](https://cookbook.sglang.io/) and platform guides for model compatibility and setup.
+## 4. 快速开始
 
-## SGL Ecosystem
-
-| Area | Projects | Purpose |
-| --- | --- | --- |
-| Diffusion | [SGLang Diffusion](https://docs.sglang.io/docs/sglang-diffusion/installation) | Built into SGLang for image and video generation with diffusion models. |
-| Audio | [SGLang Omni](https://github.com/sgl-project/sglang-omni) | Audio model serving for text-to-speech (TTS) and automatic speech recognition (ASR). |
-| Speculative Decoding | [SpecForge](https://github.com/sgl-project/SpecForge) | Train draft models for speculative decoding and deploy them with SGLang. |
-| RL and Post-Training | [Miles](https://github.com/radixark/miles), [slime](https://github.com/THUDM/slime), [AReaL](https://github.com/inclusionAI/AReaL), [Tunix](https://github.com/google/tunix), [verl](https://github.com/volcengine/verl) | Training frameworks that integrate SGLang for rollout generation. |
-| Deployment and Orchestration | [SMG](https://github.com/smg-project/smg), [RBG](https://github.com/sgl-project/rbg), [llm-d](https://llm-d.ai/docs/dev/operations/disaggregation/sglang), [Ray Serve](https://docs.ray.io/en/latest/serve/llm/user-guides/sglang.html), [NVIDIA Dynamo](https://docs.nvidia.com/dynamo/backends/sg-lang/reference-guide) | Deploy and scale SGLang inference services with routing, load balancing, and cluster orchestration. |
-| Education | [Mini-SGLang](https://github.com/sgl-project/mini-sglang), [zero-to-sglang](https://github.com/datawhalechina/zero-to-sglang), [DeepLearning.AI course](https://www.deeplearning.ai/short-courses/efficient-inference-with-sglang-text-and-image-generation/) | Learn inference engine design and efficient text and image generation through code and hands-on courses. |
-
-## Development and Contributing
-
-Contributions are welcome, from bug fixes and documentation to model support and performance improvements.
-
-### Development setup
-
-Start from the `lmsysorg/sglang:dev` Docker image, which provides development tools and most dependencies. Clone or mount your SGLang checkout inside the container, then install it in editable mode from the repository root so tests use your local Python changes:
+脚本不创建环境，也不查找 conda。先自己准备 Python 3.11+ 并激活，再装当前 checkout。
 
 ```bash
-pip install -e "python"
+git clone git@github.com:yeasen-z/sglang-inscope.git
+cd sglang-inscope
+source /path/to/env/bin/activate           # uv / venv / conda 均可
+bash inscope/scripts/setup_env.sh          # x86 与 aarch64 同一份脚本
 ```
 
-In an activated virtual environment, you can use `uv pip install --prerelease=allow -e "python"` instead. See the [development guide](https://docs.sglang.io/docs/developer_guide/development_guide_using_docker) for container setup and testing.
+Jetson Thor 还要显式设置 `CUDA_HOME`，并在 `setup_env.sh` 之后跑
+`inscope/scripts/setup_deepgemm.sh`。**只有 SM110 需要第二步**；H100 / A100 /
+B200 等机器停在 `setup_env.sh` 即可，PyPI 的 `sgl-deep-gemm==0.2.3` 就是对的。
+脚本在非 SM110 上会说明原因后退出，不会去构建。
 
-### Contribute
+接口字段、四种位置、返回解码和 HTTP 示例见
+[`inscope/README.md` §2](inscope/README.md#2-接口)。这里只给最短的一条：
 
-1. Fork the repository and create a branch for your changes. For larger changes, discuss your proposal in a [GitHub issue](https://github.com/sgl-project/sglang/issues) or on [Slack](https://slack.sglang.io/).
-2. Make your changes, run the relevant tests, and add regression coverage for fixes or new behavior. Run `pre-commit run --all-files` before submitting.
-3. Open a pull request describing the change and how you tested it. Include benchmarks or accuracy evaluations when relevant.
+```python
+import os
+os.environ["SGLANG_ENABLE_FEATURE_CAPTURE"] = "1"   # 必须在 import 前设置
 
-See the [contributor guide](https://docs.sglang.io/docs/developer_guide/contribution_guide) for formatting, testing, and pull request instructions. Documentation contributors can start with the [docs guide](docs/README.md).
+import sglang as sgl
+engine = sgl.Engine(model_path="/path/to/Qwen3-8B", tp_size=1, disable_cuda_graph=True)
+result = engine.generate(
+    prompt="Explain why the sky is blue.",
+    sampling_params={"max_new_tokens": 0},          # 只 prefill，只返特征
+    feature_capture={
+        "layers": [0, 20, -1],
+        "positions": {"mode": "last"},
+        "encoding": "float_list",
+    },
+)
+print(result["meta_info"]["features"])
+engine.shutdown()
+```
 
-## Community and Sponsorship
+完整用法、请求契约字段表与 HTTP 示例见 [`inscope/README.md`](inscope/README.md)。
 
-SGLang is hosted by [LMSYS](https://lmsys.org/about/), a non-profit open-source organization.
+---
 
-- **Community discussions:** Join [Slack](https://slack.sglang.io/) for technical questions and development discussions.
-- **Events:** Find meetups, workshops, and office hours on [SGLang Events](https://www.sglang.io/events).
-- **Updates:** Follow [X](https://x.com/lmsysorg) and [LinkedIn](https://www.linkedin.com/company/sgl-project/) for project updates, and the [LMSYS Blog](https://lmsys.org/blog/) for release announcements and technical articles.
-- **Project resources:** Explore the [documentation](https://docs.sglang.io/), [Cookbook](https://cookbook.sglang.io/), [roadmap](https://roadmap.sglang.io/), [release notes](https://github.com/sgl-project/sglang/releases), [issue tracker](https://github.com/sgl-project/sglang/issues), and [contributor guide](https://docs.sglang.io/docs/developer_guide/contribution_guide).
-- **Contact Us:** For enterprise adoption and deployment, technical consulting, sponsorship, or partnership inquiries, please contact [sglang@lmsys.org](mailto:sglang@lmsys.org).
-- **Contributor sponsorship:** Long-term active SGLang contributors are eligible for coding agent sponsorship, including Cursor, Claude Code, or OpenAI Codex. To apply, email [sglang@lmsys.org](mailto:sglang@lmsys.org) with links to your key commits or pull requests.
+## 5. 代码落点
 
-## Trusted by Industry and Research
+| 路径 | 内容 |
+|---|---|
+| `python/sglang/srt/feature_capture/` | **通用运行时**（模型无关）：`spec` 校验、`plan` 行映射、`bridge`、`recorder`、`encoding`、`capabilities` |
+| `python/sglang/srt/models/*.py` | 薄适配层：只声明 `feature_capture_sites` + 调用 `layer_capture(...)` |
+| `python/sglang/srt/layers/deep_gemm_wrapper/`、`quantization/fp8_utils.py` | SM110 / Thor 的 DeepGEMM 兼容 |
+| `inscope/` | 本 fork 的设计、交接、环境脚本、测试契约 |
+| `test/manual/feature_capture/` | 手动验收：HF 数值对照、P3–P5 场景 |
 
-SGLang serves production workloads across AI labs, cloud platforms, enterprises, and universities.
+---
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="Organizations adopting SGLang" width="800">
+## 6. 两条不能妥协的约束
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+1. **模型适配与通用逻辑解耦**：`feature_capture/` 里不出现任何模型名；模型文件只
+   声明 `feature_capture_sites`，并在已有 layer boundary 上调用
+   `layer_capture(...)` / `final_capture(...)`；位置、编码和传输逻辑不得进入模型文件。
+2. **数值与位置不能靠「看起来对」**：`L < N` 与 HF `outputs.hidden_states[L]` 对齐，
+   `L = N` 是最后 block 的 pre-final-norm 输出，必须用 block hook 作 HF 参考；
+   缓存命中重放、FP8 与 BF16 的关系都有专门用例；FP8 永不与 BF16 断言逐位相等。
+
+---
+
+## 7. 知识边界
+
+探测 AUROC 高只说明表示里存在**可利用的信号**，不等于模型「理解」了该属性，
+也不证明生成时真的使用了它。任何结论文档必须保留这条边界。

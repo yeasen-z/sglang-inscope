@@ -2,7 +2,7 @@
 
 > 本文是当前项目的唯一快速交接入口。新接手者应先读本文，再按链接进入详细设计。
 >
-> 更新时间：2026-10-20（Asia/Shanghai）
+> 更新时间：2026-10-22（Asia/Shanghai）
 
 ---
 
@@ -30,8 +30,9 @@ probe 的高 AUROC 只能说明表示中存在可利用信号，不等于模型�
 
 - 远端 workspace：`/DATA/disk2/workspace/zmosg/sglang-inscope`
 - Git remote：`https://github.com/yeasen-z/sglang-inscope.git`
-- 当前基线：`main@92580581da6fc8542a997a00c1a8b71b03497680`
-- 当前状态：生产推理链路尚未接入 feature capture；设计、移植分析、P0 环境和 P1 纯 Python 骨架已完成。
+- 功能基线：已合入 `origin/main@38ea8d30`（本地 `main` 指针仍停在 `e898054d`，落后远端）
+- 当前状态：P0–P5 已完成并在真实 GPU 验证；生产推理链路尚未接入 feature capture。
+  SM110 / Thor 的 DeepGEMM 适配在分支 `feat/deepgemm_sm110_thor`。
 
 ### 模型
 
@@ -61,6 +62,11 @@ flashinfer：flashinfer_python[cu13]==0.7.2
 sglang-kernel：0.4.10
 sglang：当前仓库 python/ 的 editable 安装
 ```
+
+x86 与 aarch64 共用 `inscope/scripts/setup_env.sh`：它不创建环境，装进你已激活的
+解释器（`PYTHON` 可显式指定），优先用 `uv`、没有则退回 `pip`。aarch64 上会额外
+检查 `CUDA_HOME` 要同时解析到 `bin/nvcc` 与 `include/curand_kernel.h`。SM110 上的
+DeepGEMM FP8 支持见[根 `README.md` 的 Thor / SM110 一节](../README.md#35-sm110jetson-thor的-deepgemm-适配)。
 
 editable 安装必须设置 `SGLANG_BUILD_RUST_EXTS=none`，否则 `setup.py` 会发现
 仓库内 Rust workspace 并要求安装 cargo。
@@ -353,6 +359,57 @@ collector、一个 final norm hook 和一个 `feature_capture_sites` 声明。�
 - 乱序层 `[32,0,16,1,31]` × 位置 `[0,11,22]` 与独立请求一致；
 - `generate+features` 的 8 个生成 token/text 与普通生成一致；
 - 稳定 capture 请求约 41–42 ms（首次 GDN/Triton 编译不计）。
+
+### 已完成：SM110 DeepGEMM 端到端验证（2026-10-22）
+
+在**全新 conda 环境** `sg_inscope`（Python 3.12.15）里，从零验证了
+SM110 的三种 DeepGEMM 形态。SGLang 侧为 `feat/deepgemm_sm110_thor` 的
+editable 安装（`-e python`），DeepGEMM 侧为 `yeasen-z/DeepGEMM-thor-sm110`。
+模型 Qwen3-8B-FP8，`--fp8-gemm-backend` 显式指定。
+
+| # | 装的 DeepGEMM | 探测 | ENABLE_JIT_DEEPGEMM | 实际路径 |
+|---|---|---|---|---|
+| 1 | 从云端源码构建的 `0.2.3+sm110` | True | True | DeepGEMM（1638 行 warmup） |
+| 2 | **Release wheel** `v0.2.3-sm110` | True | True | DeepGEMM |
+| 3 | PyPI stock `0.2.3` | False | False | **Triton（4 次 triton 日志）** |
+
+三次都成功服务并返回正确补全（"The capital of France is" → " Paris. ..."）。
+
+**结论一：不装 `+sm110` 也能跑。** SGLang 的 `pyproject.toml` 依赖
+`sgl-deep-gemm==0.2.3`，pip 会从 PyPI 装 stock 版。stock 版不支持 SM110，
+探测判定 False 后**干净地回退 Triton**，并打出一条可照做的 warning：
+
+```text
+Detected SM110 (Jetson Thor) but the installed DeepGEMM build does not
+support it; falling back to the Triton FP8 backend. Build DeepGEMM from
+the SM110 fork to enable it (see inscope/suggestion_and_require.md).
+```
+
+不崩、不算错、服务正常，只是没有 1.47x 加速。这比改之前的行为好：改之前
+`DEEPGEMM_SCALE_UE8M0` 会在 SM110 上被判 True，然后拿 stock DeepGEMM 去跑
+block-FP8，在 device 侧 trap `CUDA_ERROR_LAUNCH_FAILED (719)`。
+
+**结论二：Release wheel 可以直接下载用。** 实测：
+
+```bash
+wget https://github.com/yeasen-z/DeepGEMM-thor-sm110/releases/download/v0.2.3-sm110/sgl_deep_gemm-0.2.3%2Bsm110-py3-none-linux_aarch64.whl
+pip install --force-reinstall --no-deps sgl_deep_gemm-0.2.3+sm110-py3-none-linux_aarch64.whl
+```
+
+省掉 clone 150 MB CUTLASS 子模块 + 约 1 分钟构建。装完 `supported_arch_majors()`
+返回 `(9, 10, 11, 12)`，`bf16_gemm_nt` 冒烟通过，端到端服务正常。
+
+> 坑：**必须保留 wheel 的原文件名**。改名成 `dg-sm110.whl` 后 pip 直接报
+> `Invalid wheel filename (wrong number of parts)`——wheel 文件名本身就是元数据。
+
+**结论三：`CUDA_HOME` 在 Thor 上不是可选的。** 上游 README 称会自动按
+`$CUDA_HOME` → `PATH` 上的 `nvcc` → `/usr/local/cuda` 三级回退，但 Thor 上
+三级**全部落空**（CUDA 来自 pip `nvidia-*` 包）。必须显式指向一个同时含
+`bin/nvcc` 与 `include/curand_kernel.h` 的前缀。已作为 R13 写进
+`suggestion_and_require.md`。
+
+**环境变更（可回滚）**：`sg_inscope` 是本轮新建的验证环境，当前装着 release
+wheel。旧环境 `inscope` 未受影响。
 
 ### 下一步：交付整理 / P6
 

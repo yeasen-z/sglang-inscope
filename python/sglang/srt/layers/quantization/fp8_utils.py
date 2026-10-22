@@ -1179,8 +1179,16 @@ def initialize_fp8_gemm_config() -> None:
     backend = get_exec().kernel.fp8_gemm_runner_backend
     if backend == "auto" and get_platform().is_sm120:
         backend = "cutlass"
-    elif backend == "auto" and get_platform().is_sm110:
-        # DeepGEMM's block-FP8 kernel does not support SM110.
+    elif (
+        backend == "auto"
+        and get_platform().is_sm110
+        and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    ):
+        # SM110 (Jetson Thor) runs the SM100 tcgen05 kernels only when the
+        # DeepGEMM build routes arch_major == 11 through them AND the UE8M0
+        # scale path is active. When DEEPGEMM_SCALE_UE8M0 is set, DeepGEMM is
+        # usable and is preferred (it is also the auto default below); keep the
+        # triton fallback only for builds without that support.
         backend = "triton"
 
     backend = Fp8GemmRunnerBackend(backend)
