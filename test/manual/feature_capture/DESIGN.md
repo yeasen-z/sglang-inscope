@@ -269,7 +269,7 @@ FP8 的断言分成两类：
 - 固定 train/validation/test split
 - validation 选择 threshold 和 checkpoint
 - test 只使用 validation 选出的 threshold
-- 报告 AUROC、average precision、F1、precision、recall、TPR@FPR=0.05、置信区间/重复种子
+- 报告 AUROC、average precision、F1、precision、recall、TPR@FPR=0.05、置信区间/重复种子 <!-- codespell:ignore fpr -->
 - 与简单 baseline 比较：词法/长度 baseline、suffix logprob baseline（SafeGauge 原方法）、随机标签 baseline
 
 建议 feature 形状有三种实验：
