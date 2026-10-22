@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # Install the DeepGEMM-SM110 build that SGLang's FP8 path needs on Jetson Thor.
 #
-# Why this exists: the SM110 support lives in a DeepGEMM fork, not on PyPI, and
-# the wheel it produces is not publishable -- _C.so is only valid for one
-# (arch, torch ABI, CUDA major) triple, so it has to be built on the machine
-# that will run it. This script does clone -> build -> install -> verify so a
-# user does not have to assemble that by hand.
+# Why this exists: the SM110 support lives in a DeepGEMM fork, not on PyPI.
+# Stock `sgl-deep-gemm==0.2.3` -- what SGLang's dependency resolves to -- has no
+# arch_major == 11 routing, so this script exists to get the patched build in.
+#
+# Two ways to get one, tried in this order:
+#
+#   1. a prebuilt wheel from the fork's GitHub release (instant, no toolchain
+#      needed) -- but _C.so is only valid for the (arch, torch ABI, CUDA major)
+#      triple it was compiled against, so the wheel is only accepted after it
+#      has been installed and has proven it can dispatch on this machine;
+#   2. build from source, which always works and always matches this box.
+#
+# A wheel that fails the check is discarded and the source build takes over, so
+# the fast path is an optimisation and never a new failure mode.
 #
 # What it installs and why it must be this build:
 #   The fork routes arch_major == 11 through the SM100 tcgen05 kernels. Stock
@@ -24,9 +33,12 @@
 #   DEEPGEMM_SRC=/path/to/already/cloned/fork bash inscope/scripts/setup_deepgemm.sh
 #   PYTHON=/path/to/env/bin/python bash inscope/scripts/setup_deepgemm.sh
 #   FORCE=1 bash inscope/scripts/setup_deepgemm.sh    # rebuild+reinstall even if present
+#   FROM_SOURCE=1 bash inscope/scripts/setup_deepgemm.sh   # skip the prebuilt wheel
+#   WHEEL_URL=<url> bash inscope/scripts/setup_deepgemm.sh  # use a specific wheel
+#   ALLOW_ANY_SM=1 bash inscope/scripts/setup_deepgemm.sh  # cross-build off Thor
 #
 # Overridable: PYTHON, DEEPGEMM_SRC, DEEPGEMM_REPO, DEEPGEMM_REF, WORK_DIR,
-#              CUDA_HOME, FORCE, KEEP_SRC.
+#              CUDA_HOME, FORCE, KEEP_SRC, FROM_SOURCE, WHEEL_URL, ALLOW_ANY_SM.
 
 set -euo pipefail
 
@@ -34,6 +46,9 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 DEEPGEMM_REPO="${DEEPGEMM_REPO:-https://github.com/yeasen-z/DeepGEMM-thor-sm110.git}"
 DEEPGEMM_REF="${DEEPGEMM_REF:-main}"
 WORK_DIR="${WORK_DIR:-${TMPDIR:-/tmp}/deepgemm-sm110-build}"
+# The published wheel for the tested triple. Override WHEEL_URL to point at a
+# different release, or set FROM_SOURCE=1 to ignore it entirely.
+DEEPGEMM_WHEEL_URL="${WHEEL_URL:-https://github.com/yeasen-z/DeepGEMM-thor-sm110/releases/download/v0.2.3-sm110/sgl_deep_gemm-0.2.3+sm110-py3-none-linux_aarch64.whl}"
 MIN_PY_MAJOR=3
 MIN_PY_MINOR=11
 
@@ -100,38 +115,73 @@ trap 'rm -rf "$NEUTRAL_DIR"' EXIT
 # Same trap as the SGLang install: on Thor nvcc and the device headers are often
 # in different prefixes. The fork's build script checks this too; checking here
 # means the user gets the message before a 150 MB clone.
+#
+# Only the source build needs this. A prebuilt wheel brings its own _C.so and
+# still JITs at runtime, so a missing nvcc is a warning there, not a stop.
+_need_build=1
 if [[ -z "${CUDA_HOME:-}" ]]; then
   if command -v nvcc >/dev/null 2>&1; then
     CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
     echo "== CUDA_HOME: $CUDA_HOME (inferred from nvcc on PATH)"
   else
-    cat >&2 <<'MSG'
-error: CUDA_HOME is not set and nvcc is not on PATH.
-
-DeepGEMM compiles its host layer and JITs device kernels, so a full CUDA
-toolkit is required (runtime-only is not enough):
-
-    export CUDA_HOME=/path/to/cuda     # must contain bin/nvcc
-MSG
-    exit 1
+    _need_build=0
   fi
 else
   echo "== CUDA_HOME: $CUDA_HOME"
 fi
-export CUDA_HOME
-export CUDACXX="${CUDACXX:-$CUDA_HOME/bin/nvcc}"
+if [[ -n "${CUDA_HOME:-}" ]]; then
+  export CUDA_HOME
+  export CUDACXX="${CUDACXX:-$CUDA_HOME/bin/nvcc}"
+fi
 
-if [[ ! -x "$CUDA_HOME/bin/nvcc" ]]; then
+if [[ $_need_build -eq 1 && ! -x "${CUDA_HOME:-}/bin/nvcc" ]]; then
   echo "error: no executable nvcc at $CUDA_HOME/bin/nvcc." >&2
   exit 1
 fi
-if [[ ! -f "$CUDA_HOME/include/curand_kernel.h" ]]; then
+if [[ $_need_build -eq 1 && ! -f "$CUDA_HOME/include/curand_kernel.h" ]]; then
   cat >&2 <<EOF
 warning: $CUDA_HOME/include/curand_kernel.h is missing.
          The host layer will build, but the runtime JIT needs the CUDA device
          headers and will fail later. Either point CUDA_HOME at a prefix with
          BOTH bin/nvcc and include/, or add the header directory to CPATH.
 EOF
+fi
+
+# --- Is this machine actually an SM110 box? ---------------------------------
+# This build exists for one reason: stock DeepGEMM has no kernel routing for
+# arch_major 11. On every other device the ordinary `sgl-deep-gemm==0.2.3` that
+# SGLang depends on is the correct package, and installing this fork there would
+# either do nothing useful or replace a working build with one compiled for a
+# different architecture. So say so and stop rather than spend two minutes and
+# 150 MB on it.
+_actual_sm="$("$PY" - <<'PYEOF' 2>/dev/null || true
+import torch
+try:
+    if not torch.cuda.is_available():
+        print(0)
+    else:
+        major, minor = torch.cuda.get_device_capability()
+        print(major * 10 + minor)
+except Exception:
+    print(0)
+PYEOF
+)"
+_actual_sm="${_actual_sm:-0}"
+
+if [[ "$_actual_sm" != "110" && "${ALLOW_ANY_SM:-0}" != "1" ]]; then
+  cat <<EOF
+== this machine reports sm_${_actual_sm}, not sm_110 (Jetson Thor).
+
+The SM110 fork is only needed on Thor. Everywhere else the ordinary build that
+SGLang already depends on -- sgl-deep-gemm==0.2.3 from PyPI -- is the right one,
+and it is already installed as part of the normal setup. Nothing to do here.
+
+If you are cross-building a wheel for a Thor to install elsewhere, or you know
+this is wrong, re-run with:
+
+    ALLOW_ANY_SM=1 bash inscope/scripts/setup_deepgemm.sh
+EOF
+  exit 0
 fi
 
 # --- Already installed? -----------------------------------------------------
@@ -154,8 +204,101 @@ PYEOF
   echo "== no SM110-capable DeepGEMM found; building it"
 fi
 
-# --- Clone ------------------------------------------------------------------
+# --- Try the prebuilt wheel first -------------------------------------------
+# _C.so is bound to the (arch, torch ABI, CUDA major) triple it was compiled
+# against, and a wheel tag only encodes the CPU arch. So the wheel is treated as
+# a candidate, not an answer: it is installed, asked whether it can dispatch on
+# this machine, and rolled back if it cannot. Every failure here is a fall
+# through to the source build rather than an error.
+WHEEL_FILE=""
+_install_ok=""
+
+verify_installed() {
+  # Prints nothing; exits 0 only if the installed build really dispatches SM110.
+  # Runs outside the source tree so a checkout cannot shadow the installed wheel.
+  (cd "$NEUTRAL_DIR" && "$PY" - <<'PYEOF' >/dev/null 2>&1
+import sys
+import deep_gemm
+query = getattr(deep_gemm, "supported_arch_majors", None)
+if callable(query):
+    sys.exit(0 if 11 in {int(v) for v in query()} else 1)
+sys.exit(0 if "sm110" in str(getattr(deep_gemm, "__version__", "")) else 1)
+PYEOF
+  )
+}
+
+try_prebuilt_wheel() {
+  local url="$1" dir file
+
+  # Only aarch64 builds exist, and only a machine that can run them should try.
+  if [[ "$(uname -m)" != "aarch64" ]]; then
+    echo "== prebuilt wheel: skipped (published for aarch64, this is $(uname -m))"
+    return 1
+  fi
+
+  case "$url" in
+    *://*) ;;
+    *) echo "== prebuilt wheel: $url looks like a local path; using it as-is"
+       if [[ ! -f "$url" ]]; then
+         echo "== prebuilt wheel: not found; falling back to source build"
+         return 1
+       fi
+       WHEEL_FILE="$url"; return 0 ;;
+  esac
+
+  # Download to a scratch dir; never into the repo.
+  dir="$(mktemp -d)"
+  # pip refuses a wheel whose filename does not encode name/version/python/abi/
+  # platform, so keep the URL's basename rather than inventing one.
+  file="$dir/${url##*/}"
+
+  echo "== prebuilt wheel: $url"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 3 --connect-timeout 15 -o "$file" "$url" || {
+      echo "== prebuilt wheel: download failed; falling back to source build"
+      rm -rf "$dir"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --tries=3 --timeout=30 -O "$file" "$url" || {
+      echo "== prebuilt wheel: download failed; falling back to source build"
+      rm -rf "$dir"; return 1; }
+  else
+    echo "== prebuilt wheel: neither curl nor wget available; falling back"
+    rm -rf "$dir"; return 1
+  fi
+
+  # A truncated download is the common failure on a flaky link, and pip's error
+  # for it is opaque ("not a valid wheel filename" / "BadZipFile").
+  if ! "$PY" - "$file" <<'PYEOF' >/dev/null 2>&1
+import sys, zipfile
+zipfile.ZipFile(sys.argv[1]).testzip()
+PYEOF
+  then
+    echo "== prebuilt wheel: download is truncated or corrupt; falling back"
+    rm -rf "$dir"; return 1
+  fi
+
+  WHEEL_FILE="$file"
+  return 0
+}
+
+if [[ "${FROM_SOURCE:-0}" != "1" && -z "${DEEPGEMM_SRC:-}" ]]; then
+  if try_prebuilt_wheel "$DEEPGEMM_WHEEL_URL"; then
+    echo "== installing prebuilt wheel"
+    if "$PY" -m pip install --no-deps --force-reinstall "$WHEEL_FILE" >/dev/null 2>&1 \
+       && verify_installed; then
+      _install_ok="wheel"
+    else
+      echo "== prebuilt wheel: installed but cannot dispatch SM110 on this machine."
+      echo "   (its _C.so was built for a different torch ABI or CUDA major)"
+      echo "   falling back to a source build, which matches this box by construction."
+      # Leave the environment as we found it; the build below reinstalls anyway.
+    fi
+  fi
+fi
+
+# --- Clone + build (only if the prebuilt wheel did not work out) -------------
 SRC="${DEEPGEMM_SRC:-}"
+if [[ -z "$_install_ok" ]]; then
 if [[ -n "$SRC" ]]; then
   if [[ ! -f "$SRC/build_sgl_deep_gemm.sh" ]]; then
     echo "error: DEEPGEMM_SRC=$SRC does not look like the DeepGEMM fork" >&2
@@ -174,7 +317,27 @@ else
     echo "   ~150 MB of CUTLASS submodule comes with it; this is the slow step."
     rm -rf "$SRC"
     mkdir -p "$(dirname "$SRC")"
-    git clone --depth 1 --branch "$DEEPGEMM_REF" "$DEEPGEMM_REPO" "$SRC"
+    if ! git clone --depth 1 --branch "$DEEPGEMM_REF" "$DEEPGEMM_REPO" "$SRC"; then
+      cat >&2 <<EOF
+
+error: could not clone $DEEPGEMM_REPO
+
+Both ways of getting the SM110 build have now failed: the prebuilt wheel was
+not usable and the source repository could not be reached.
+
+If this machine can reach the wheel but not git, or you have the release
+already, point the script at a local copy:
+
+    WHEEL_URL=/path/to/sgl_deep_gemm-0.2.3+sm110-py3-none-linux_aarch64.whl \
+      bash inscope/scripts/setup_deepgemm.sh
+
+    DEEPGEMM_SRC=/path/to/already/cloned/DeepGEMM-thor-sm110 \
+      bash inscope/scripts/setup_deepgemm.sh
+
+Retrying usually works too -- this clone is the largest download in the setup.
+EOF
+      exit 1
+    fi
   fi
 fi
 
@@ -198,6 +361,8 @@ echo "== wheel: $WHEEL"
 # keeps the old binary.
 echo "== installing"
 "$PY" -m pip install --no-deps --force-reinstall "$WHEEL"
+_install_ok="source"
+fi   # end of the source-build branch
 
 # --- Verify -----------------------------------------------------------------
 echo "== verify"
@@ -278,20 +443,30 @@ EOF
 fi
 
 # --- Report where things landed ---------------------------------------------
-if [[ "${KEEP_SRC:-1}" == "1" ]]; then
-  echo "== source kept at: $SRC"
+if [[ "$_install_ok" == "source" && "${KEEP_SRC:-1}" == "1" ]]; then
+  echo "== source kept at: ${SRC:-<none>}"
   echo "   (next run reuses it; set KEEP_SRC=0 to leave only the clone cache)"
+fi
+
+if [[ "$_install_ok" == "wheel" ]]; then
+  _origin="prebuilt wheel ($DEEPGEMM_WHEEL_URL)"
+else
+  _origin="source build (${WHEEL:-?})"
 fi
 
 cat <<EOF
 
 == DeepGEMM-SM110 ready
 
-   wheel    $WHEEL
+   from     $_origin
    python   $PY
 
 SGLang will now take the DeepGEMM FP8 path on SM110. Make sure it can use it:
    export SGLANG_ENABLE_JIT_DEEPGEMM=1
+
+Note that kernel compilation still happens at runtime, and it still needs a CUDA
+toolkit with device headers -- a prebuilt wheel only saves the host-layer build:
+
    export CUDA_HOME=<dir with bin/nvcc AND include/curand_kernel.h>
 
 First startup compiles kernels for the M shapes actually used (several minutes,
