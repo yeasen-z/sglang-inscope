@@ -83,9 +83,12 @@ class GraphFeatureCaptureRecorder:
             indices.zero_()
         for slot in plan:
             indices = self._indices[slot.layer]
-            indices[: len(slot.rows)].copy_(
-                torch.tensor(slot.rows, dtype=torch.long, device=indices.device)
-            )
+            # Creating this tensor directly on CUDA synchronizes the replay
+            # stream. Pinned host rows allow the copy to overlap earlier work;
+            # PyTorch's host allocator tracks the asynchronous copy lifetime.
+            rows = torch.tensor(slot.rows, dtype=torch.long, device="cpu",
+                                pin_memory=indices.is_cuda)
+            indices[: len(slot.rows)].copy_(rows, non_blocking=indices.is_cuda)
         self._plan = plan
 
     def capture_hook(self, *, layer: int):

@@ -179,5 +179,27 @@ class TestFeatureCaptureRecorder(CustomTestCase):
             recorder.device_output()
 
 
+
+class TestFeatureEncodingParity(CustomTestCase):
+    def test_base64_preserves_model_dtype_and_noncontiguous_values(self):
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                values = torch.arange(24, dtype=dtype).reshape(4, 6)[:, ::2]
+                self.assertFalse(values.is_contiguous())
+                spec = validate(
+                    {"layers": [4], "encoding": "base64"},
+                    num_layers=4, hidden_size=3, prompt_ids=list(range(4)),
+                )
+                records = build_feature_records(
+                    spec=spec, values={(4, position): values[position] for position in range(4)},
+                )
+                record = records[0]
+                expected = torch.stack([values[position] for position in record["positions"]])
+                self.assertEqual(record["dtype"], str(dtype).removeprefix("torch."))
+                self.assertEqual(
+                    record["data"],
+                    base64.b64encode(expected.view(torch.uint8).numpy().tobytes()).decode("ascii"),
+                )
+
 if __name__ == "__main__":
     unittest.main()

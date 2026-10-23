@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
-import base64
+try:
+    import pybase64 as base64
+except ImportError:
+    import base64
 
 import torch
 

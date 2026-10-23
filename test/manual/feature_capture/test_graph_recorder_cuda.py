@@ -57,5 +57,52 @@ class TestGraphRecorderCUDA(unittest.TestCase):
         torch.cuda.synchronize()
 
 
+    def test_many_async_host_index_updates_keep_each_replay_output(self):
+        layers = (8, 16, 24, 36)
+        capacity = 64
+        source = torch.arange(capacity * 8, device="cuda", dtype=torch.float32).reshape(capacity, 8)
+        recorder = GraphFeatureCaptureRecorder(layers=layers, capacity=capacity, device=source.device)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+
+        def plan_for(index):
+            plan = []
+            offset = 0
+            for layer_index, layer in enumerate(layers):
+                rows = tuple((index * 7 + layer_index * 3 + k * 11) % capacity
+                             for k in range(1 + (index + layer_index) % 5))
+                plan.append(SlotPlan(layer=layer, rows=rows,
+                                     segments=((f"request-{index}", rows),), out_start=offset))
+                offset += len(rows)
+            return tuple(plan)
+
+        def forward():
+            for layer in layers:
+                recorder.capture_hook(layer=layer)(source + layer)
+
+        with torch.cuda.stream(stream):
+            recorder.prepare(plan_for(0))
+            forward()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            forward()
+        pointers = {layer: recorder._indices[layer].data_ptr() for layer in layers}
+        outputs, expected = [], []
+        host_source = torch.arange(capacity * 8).reshape(capacity, 8).float()
+        with torch.cuda.stream(stream):
+            for index in range(256):
+                plan = plan_for(index)
+                recorder.prepare(plan)
+                graph.replay()
+                outputs.append(recorder.device_output().tensor)
+                expected.append(torch.cat([host_source[list(slot.rows)] + slot.layer for slot in plan]))
+                self.assertEqual(pointers, {layer: recorder._indices[layer].data_ptr() for layer in layers})
+        stream.synchronize()
+        for actual, reference in zip(outputs, expected):
+            self.assertTrue(torch.equal(actual.cpu(), reference))
+
+
+
 if __name__ == "__main__":
     unittest.main()
