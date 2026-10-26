@@ -2600,6 +2600,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
+    # Its text tower shares the dense model's residual-boundary recorder.
+    # The capability gate still rejects multimodal requests.
+    feature_capture_sites = ("block_output",)
+
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 

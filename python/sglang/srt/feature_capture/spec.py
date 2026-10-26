@@ -34,6 +34,7 @@ from a forward hook on the last decoder block. ``-1`` aliases ``N``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = "inscope.feature_capture.v1"
@@ -43,7 +44,9 @@ SUPPORTED_ENCODINGS: Tuple[str, ...] = ("base64", "float_list")
 POSITION_MODES: Tuple[str, ...] = ("last", "explicit", "suffix_last", "all")
 
 # Conservative FP32 byte estimate, matching the sibling capture runtimes.
-DEFAULT_MAX_TARGETS = 8
+DEFAULT_MAX_TARGETS = int(os.environ.get("SGLANG_FEATURE_CAPTURE_MAX_TARGETS", "8"))
+if not 1 <= DEFAULT_MAX_TARGETS <= 64:
+    raise ValueError("SGLANG_FEATURE_CAPTURE_MAX_TARGETS must lie in [1, 64]")
 DEFAULT_MAX_BYTES = 128 * 1024**2
 
 
