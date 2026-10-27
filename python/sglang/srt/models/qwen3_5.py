@@ -1975,6 +1975,30 @@ class Qwen3_5ForCausalLM(nn.Module):
                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
 
+            cutoff = forward_batch.feature_capture_early_exit_layer
+            if (cutoff is not None and self.pp_group.world_size == 1
+                    and not self.layers_to_capture
+                    and input_deepstack_embeds is None
+                    and layer_idx + 1 >= cutoff):
+                # Hooks normally run at the NEXT block's entry. Complete the
+                # pending FFN residual and capture that boundary before exiting.
+                hidden_states, snapshot = layer.attn_boundary.capture_output(
+                    hidden_states, forward_batch
+                )
+                recorder = forward_batch.feature_capture_recorder
+                capture = recorder.capture_hook(layer=cutoff) if recorder is not None else None
+                if capture is not None:
+                    capture(snapshot)
+                residual_batch.clear(forward_batch)
+                if not getattr(self, "_feature_exit_reported", False):
+                    print(
+                        f"Feature-only early exit: boundary={cutoff} "
+                        f"executed_decoder_blocks={layer_idx + 1 - self.start_layer}; "
+                        "later blocks and final norm skipped", flush=True,
+                    )
+                    self._feature_exit_reported = True
+                return snapshot
+
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
 
