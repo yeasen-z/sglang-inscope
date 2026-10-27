@@ -537,6 +537,29 @@ class Qwen3Model(Qwen2Model):
                     ),
                 ),
             )
+            # A feature-only prefill has no consumer for later transformer
+            # layers.  The scheduler computes the maximum requested boundary
+            # for the whole batch; stop only after that boundary has captured.
+            if (
+                forward_batch.feature_capture_early_exit_layer is not None
+                and self.pp_group.world_size == 1
+                and i + 1 >= forward_batch.feature_capture_early_exit_layer
+            ):
+                break
+        if (
+            forward_batch.feature_capture_early_exit_layer is not None
+            and self.pp_group.world_size == 1
+        ):
+            early_exit = forward_batch.feature_capture_early_exit_layer
+            if early_exit == len(self.layers):
+                capture = feature_capture.final_capture(
+                    num_layers=len(self.layers),
+                    recorder=forward_batch.feature_capture_recorder,
+                )
+                if capture is not None:
+                    capture(hidden_states)
+            return hidden_states
+
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         hidden_states = residual_batch.final_norm(

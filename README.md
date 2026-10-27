@@ -31,6 +31,7 @@
 | 功能 | 状态 | 入口 |
 |---|---|---|
 | 多层采集，默认单请求最多 8 层，`L ∈ [0, N]`，`-1` 是最后一层 pre-final-norm | 已交付 | `feature_capture.layers` |
+| feature-only prefill 在 batch 请求的最高层提前停止 | 已交付 | 自动启用；仅安全的 prefill-only batch |
 | 位置：`last` / `explicit`（含负索引）/ `suffix_last` / `all` | 已交付 | `feature_capture.positions` |
 | `suffix_last` 找不到 gauge 就报错，不退化成 `last` | 已交付 | 同上 |
 | 只采特征，跳过 decode / 采样；纯特征还跳过 vocabulary projection | 已交付 | `max_new_tokens=0` |

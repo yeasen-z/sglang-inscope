@@ -1962,6 +1962,15 @@ class Qwen3_5ForCausalLM(nn.Module):
                     ),
                 )
 
+            # See Qwen3Model: this is enabled only for a safe feature-only
+            # prefill batch, after the highest requested block boundary.
+            if (
+                forward_batch.feature_capture_early_exit_layer is not None
+                and self.pp_group.world_size == 1
+                and layer_idx + 1 >= forward_batch.feature_capture_early_exit_layer
+            ):
+                break
+
             # Process deepstack embeddings if provided
             if (
                 input_deepstack_embeds is not None
@@ -1974,6 +1983,20 @@ class Qwen3_5ForCausalLM(nn.Module):
                     forward_batch,
                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
                 )
+
+        if (
+            forward_batch.feature_capture_early_exit_layer is not None
+            and self.pp_group.world_size == 1
+        ):
+            early_exit = forward_batch.feature_capture_early_exit_layer
+            if early_exit == len(self.layers):
+                capture = feature_capture.final_capture(
+                    num_layers=len(self.layers),
+                    recorder=forward_batch.feature_capture_recorder,
+                )
+                if capture is not None:
+                    capture(hidden_states)
+            return hidden_states
 
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
