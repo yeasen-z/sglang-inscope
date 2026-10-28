@@ -1034,7 +1034,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and all(spec is not None for spec in feature_capture_specs)
             and not batch.return_logprob
             and capture_hidden_mode == CaptureHiddenMode.NULL
-            and not batch.return_pooled_hidden_states
+            and not any(req.return_pooled_hidden_states for req in batch.reqs)
             and not return_hidden_states_before_norm
             and (batch.sampling_info is None or batch.sampling_info.grammars is None)
         ):

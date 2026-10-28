@@ -37,11 +37,16 @@ class DualGemm:
         if not is_cuda():
             return None
 
-        from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
-            MAX_DUAL_GEMM_DECODE_TOKENS,
-            DualGemmQuantMode,
-            can_use_dual_gemm,
-        )
+        try:
+            from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
+                MAX_DUAL_GEMM_DECODE_TOKENS,
+                DualGemmQuantMode,
+                can_use_dual_gemm,
+            )
+        except ImportError:
+            # Cutlass/CuteDSL is an optional fused path.  The ordinary
+            # unfused gate/up + SiLU path remains valid for local FP8 runs.
+            return None
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         gate_up_method = gate_up_proj.quant_method
