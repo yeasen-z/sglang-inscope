@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-import os
 from typing import Any, Mapping, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = "inscope.feature_capture.v1"
