@@ -1443,6 +1443,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.feature_capture_requested:
             if not self.feature_graph_layers or not forward_batch.is_prefill_only:
                 return False
+            from sglang.srt.feature_capture.early_exit import configured_layer
+            if forward_batch.feature_capture_early_exit_layer != configured_layer():
+                return False
             if any(
                 slot.layer not in self.feature_graph_layers
                 for slot in forward_batch.feature_capture_plan
@@ -1718,6 +1721,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch.feature_capture_requested = True
                 forward_batch.is_prefill_only = True
                 forward_batch.feature_capture_recorder = recorder
+                from sglang.srt.feature_capture.early_exit import configured_layer
+                cutoff = configured_layer()
+                if cutoff is not None and cutoff != max(self.feature_graph_layers):
+                    raise ValueError("feature graph layers must end at the configured early exit")
+                forward_batch.feature_capture_early_exit_layer = cutoff
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
@@ -2045,6 +2053,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_prefill_only=forward_batch.is_prefill_only,
             feature_capture_requested=forward_batch.feature_capture_requested,
             feature_capture_plan=forward_batch.feature_capture_plan,
+            feature_capture_early_exit_layer=forward_batch.feature_capture_early_exit_layer,
             extend_seq_lens=forward_batch.extend_seq_lens,
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,

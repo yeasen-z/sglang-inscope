@@ -43,6 +43,7 @@ from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.feature_capture.plan import SlotPlan, build_slot_plan
 from sglang.srt.feature_capture.recorder import FeatureCaptureRecorder
+from sglang.srt.feature_capture.early_exit import resolve_layer as resolve_feature_exit
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
@@ -575,9 +576,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     feature_capture_requested: bool = False
     feature_capture_plan: Tuple[SlotPlan, ...] = ()
     feature_capture_recorder: Optional[FeatureCaptureRecorder] = None
-    # Highest requested feature boundary for a safe feature-only prefill.
-    # When set, model adapters may stop after this boundary because the batch
-    # has no logits/hidden-state consumer that needs later layers.
     feature_capture_early_exit_layer: Optional[int] = None
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
@@ -1026,26 +1024,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if feature_capture_plan
             else None
         )
-        feature_capture_specs = [req.feature_capture for req in batch.reqs]
-        feature_capture_early_exit_layer = None
-        if (
-            batch.is_prefill_only
-            and feature_capture_specs
-            and all(spec is not None for spec in feature_capture_specs)
-            and not batch.return_logprob
-            and capture_hidden_mode == CaptureHiddenMode.NULL
-            and not any(req.return_pooled_hidden_states for req in batch.reqs)
-            and not return_hidden_states_before_norm
-            and (batch.sampling_info is None or batch.sampling_info.grammars is None)
-        ):
-            max_requested_layer = max(
-                max(spec.layers) for spec in feature_capture_specs if spec is not None
-            )
-            # Layer 0 is the embedding boundary; model adapters currently
-            # enter the decoder loop before invoking the capture hook there.
-            # Keep that edge case on the existing full-forward path.
-            if max_requested_layer >= 1:
-                feature_capture_early_exit_layer = max_requested_layer
+        feature_capture_early_exit_layer = resolve_feature_exit(
+            batch, capture_hidden_mode, return_hidden_states_before_norm
+        )
 
         # Mirror the grammars-population behavior previously done in
         # ScheduleBatch.get_model_worker_batch.

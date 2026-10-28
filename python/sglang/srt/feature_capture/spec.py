@@ -33,6 +33,7 @@ from a forward hook on the last decoder block. ``-1`` aliases ``N``.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 import os
 from typing import Any, Mapping, Optional, Sequence, Tuple
@@ -177,7 +178,7 @@ def validate(
     prompt_ids: Optional[Sequence[int]] = None,
     suffix_token_ids: Optional[Sequence[int]] = None,
     max_targets: int = DEFAULT_MAX_TARGETS,
-    max_bytes: int = DEFAULT_MAX_BYTES,
+    max_bytes: Optional[int] = None,
 ) -> FeatureRequestSpec:
     """Validate a raw ``feature_capture`` request and resolve its positions.
 
@@ -199,6 +200,10 @@ def validate(
     Raises:
         FeatureCaptureError: on any unsupported or out-of-range request.
     """
+    if max_bytes is None:
+        max_bytes = int(os.environ.get('SGLANG_FEATURE_CAPTURE_MAX_BYTES', DEFAULT_MAX_BYTES))
+    if max_bytes < 0:
+        raise FeatureCaptureError('feature capture byte limit must be nonnegative')
     if not isinstance(raw, Mapping):
         raise FeatureCaptureError("feature_capture must be a mapping")
     _reject_unknown(raw, ("layers", "site", "positions", "encoding"), "feature_capture")
