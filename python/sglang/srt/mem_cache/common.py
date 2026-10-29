@@ -195,6 +195,9 @@ def _req_radix_key(
     token_ids: array[int],
     max_prefix_len: Optional[int] = None,
 ) -> RadixKey:
+    seed_depth = (req.sampling_params.custom_params or {}).get("cache_prefix_len")
+    if seed_depth is not None:
+        max_prefix_len = seed_depth if max_prefix_len is None else min(max_prefix_len, seed_depth)
     # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
     # bounded replay); cap the match so the window is re-prefilled.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)

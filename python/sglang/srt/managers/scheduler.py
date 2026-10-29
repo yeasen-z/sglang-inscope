@@ -1353,6 +1353,8 @@ class Scheduler(
         self.prefill_decode_interval_min_bs = (
             get_schedule().prefill_decode_interval_min_bs
         )
+        self.num_continuous_decode_steps = get_schedule().num_continuous_decode_steps
+        self._continuous_decode_remaining = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1407,6 +1409,19 @@ class Scheduler(
 
         self._prefill_decode_interval_remaining -= 1
         return True
+
+    def _should_continue_decode(self, running_batch: ScheduleBatch) -> bool:
+        return self._continuous_decode_remaining > 0 and not running_batch.is_empty()
+
+    def _arm_continuous_decode(self, batch: Optional[ScheduleBatch]) -> None:
+        if batch is None or not (
+            batch.forward_mode.is_decode() or batch.forward_mode.is_mixed()
+        ):
+            self._continuous_decode_remaining = 0
+        elif self._continuous_decode_remaining:
+            self._continuous_decode_remaining -= 1
+        else:
+            self._continuous_decode_remaining = self.num_continuous_decode_steps - 1
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
@@ -3965,7 +3980,9 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif self._should_defer_prefill(running_batch):
+        elif self._should_continue_decode(
+            running_batch
+        ) or self._should_defer_prefill(running_batch):
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -4009,6 +4026,7 @@ class Scheduler(
         # back as last_batch and is filtered in place, not merged with itself.
         ret = self.dp_attn_adapter.maybe_convert_decode_to_extend(ret)
         self._arm_prefill_decode_interval(ret)
+        self._arm_continuous_decode(ret)
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(
@@ -4372,13 +4390,15 @@ class Scheduler(
         if (
             self.is_mixed_chunk
             and not running_batch.is_empty()
-            and not (new_batch.return_logprob or running_batch.return_logprob)
+            and all(
+                not req.return_logprob or req.logprob_start_len == -1
+                for req in new_batch.reqs + running_batch.reqs
+            )
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
             # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
             finishing_reqs = self._reqs_finishing_inflight(running_batch)
             running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
             if finishing_reqs:

@@ -1431,6 +1431,7 @@ class Req(ReqDllmMixin):
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
             or positional_embed_overrides is not None
+            or (sampling_params.custom_params or {}).get("skip_radix_cache_insert", False)
         )
         # Set when the request's in-flight forward ran on KV that never landed:
         # that forward's output is dropped and the request finishes with it.
@@ -3399,9 +3400,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens = self.prefix_lens + running_prefix_lens
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
-        # TODO (lianmin): Revisit this. It should be seq_len - 1
+        # Mixed logprob requests are output-only: no input positions, including
+        # the one-token decode tails, contribute prompt logprobs.
         self.extend_logprob_start_lens = (
-            self.extend_logprob_start_lens + [0] * running_bs
+            self.extend_lens[:]
+            if self.return_logprob
+            else self.extend_logprob_start_lens + [0] * running_bs
         )
         self.is_prefill_only = False
 
