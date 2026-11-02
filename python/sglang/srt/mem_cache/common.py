@@ -197,7 +197,9 @@ def _req_radix_key(
 ) -> RadixKey:
     seed_depth = (req.sampling_params.custom_params or {}).get("cache_prefix_len")
     if seed_depth is not None:
-        max_prefix_len = seed_depth if max_prefix_len is None else min(max_prefix_len, seed_depth)
+        max_prefix_len = (
+            seed_depth if max_prefix_len is None else min(max_prefix_len, seed_depth)
+        )
     # A reused prefix may carry stale or unwritten SWA (the unified_kv ring, decoder
     # bounded replay); cap the match so the window is re-prefilled.
     reprefill_tail = tree_cache.swa_reprefill_tail_tokens(req)
@@ -270,14 +272,28 @@ def match_kv_cache(
     return match_result
 
 
+def _checkpoint_limit(req: Req, tree_cache: BasePrefixCache, computed: int):
+    if not req.skip_radix_cache_insert:
+        return computed
+    limit = (req.sampling_params.custom_params or {}).get("cache_original_prefix_len")
+    if limit is None:
+        return None
+    assert not tree_cache.supports_mamba() and not tree_cache.supports_swa(), (
+        "Original-prefix-only checkpointing requires full-attention KV"
+    )
+    limit = min(computed, limit)
+    return limit if limit > req.kv.cache_protected_len else None
+
+
 def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     """Publish what the running request has computed so far, unless it is
     barred from the tree."""
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
-    if not req.skip_radix_cache_insert:
-        tree_cache.checkpoint(req, up_to=req.extend_end)
+    limit = _checkpoint_limit(req, tree_cache, req.extend_end)
+    if limit is not None:
+        tree_cache.checkpoint(req, up_to=limit)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
 
@@ -417,7 +433,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         return
 
     owned_kv_len = req.owned_kv_len()
-    checkpoint = checkpoint and not req.skip_radix_cache_insert
+    limit = _checkpoint_limit(req, tree_cache, owned_kv_len) if checkpoint else None
+    checkpoint = limit is not None
     if checkpoint:
         # A tree that takes over component state (mamba) must see the request
         # finished, or the insert forks the state and the slot leaks.
@@ -426,7 +443,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         )
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
-        tree_cache.checkpoint(req, up_to=owned_kv_len)
+        tree_cache.checkpoint(req, up_to=limit)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unlock(req.lock)

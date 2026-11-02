@@ -29,7 +29,9 @@ class TestUnoInactiveLoRABatch(CustomTestCase):
         backend = _InactiveSkippingBackend()
         manager = LoRAManager.__new__(LoRAManager)
         manager.lora_backend = backend
-        forward_batch = SimpleNamespace(lora_ids=[None], batch_size=1)
+        forward_batch = SimpleNamespace(
+            lora_ids=[None], lora_start_lens=None, batch_size=1
+        )
 
         manager.prepare_lora_batch(forward_batch)
 
