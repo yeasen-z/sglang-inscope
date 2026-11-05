@@ -1189,10 +1189,19 @@ class Req(ReqDllmMixin):
         self.feature_capture_values: Dict[Tuple[int, int], torch.Tensor] = {}
 
         # Extra key for caller-defined request classification.
-        if lora_id is not None:
-            extra_key = (
-                extra_key or ""
-            ) + lora_id  # lora_id is concatenated to the extra key
+        lora_start = (sampling_params.custom_params or {}).get("lora_start_len", 0)
+        if lora_start:
+            assert lora_id is not None and 0 < lora_start < len(origin_input_ids)
+            sampling_params = copy.copy(sampling_params)
+            sampling_params.custom_params = dict(
+                sampling_params.custom_params,
+                skip_radix_cache_insert=True,
+                cache_prefix_len=lora_start,
+                cache_original_prefix_len=lora_start,
+            )
+            self.sampling_params = sampling_params
+        elif lora_id is not None:
+            extra_key = (extra_key or "") + lora_id
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
@@ -1431,7 +1440,9 @@ class Req(ReqDllmMixin):
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST
             or positional_embed_overrides is not None
-            or (sampling_params.custom_params or {}).get("skip_radix_cache_insert", False)
+            or (sampling_params.custom_params or {}).get(
+                "skip_radix_cache_insert", False
+            )
         )
         # Set when the request's in-flight forward ran on KV that never landed:
         # that forward's output is dropped and the request finishes with it.

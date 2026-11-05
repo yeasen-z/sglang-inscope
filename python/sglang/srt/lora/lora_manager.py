@@ -495,6 +495,24 @@ class LoRAManager:
         self.lora_backend.reset_routing_cache()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        starts = forward_batch.lora_start_lens
+        if starts and any(starts) and forward_batch.forward_mode.is_extend():
+            ids, lengths = [], []
+            for uid, start, prefix, length in zip(
+                forward_batch.lora_ids,
+                starts,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+            ):
+                base = min(length, max(0, start - prefix))
+                if base:
+                    ids.append(None)
+                    lengths.append(base)
+                if length > base:
+                    ids.append(uid)
+                    lengths.append(length - base)
+            self.prepare_lora_token_segments(lora_ids=ids, segment_lens=lengths)
+            return
         # Some internal-only backends (currently UNO) use explicit token-row
         # routing for their adapted forwards and want all-base batches to run
         # through the plain model path.  Clear any routing retained by the

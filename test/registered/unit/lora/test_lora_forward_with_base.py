@@ -131,6 +131,7 @@ def test_manager_preserves_graph_flags_and_phase(graph_enabled, mode):
     batch = SimpleNamespace(
         batch_size=2,
         lora_ids=["adapter", None],
+        lora_start_lens=None,
         forward_mode=SimpleNamespace(
             is_cuda_graph=lambda: mode != "prefill",
             is_extend=lambda: mode != "decode",

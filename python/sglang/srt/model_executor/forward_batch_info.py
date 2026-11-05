@@ -641,6 +641,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     contains_last_prefill_chunk: bool = True
     # For LoRA
     lora_ids: Optional[List[str]] = None
+    lora_start_lens: Optional[List[int]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
     watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
@@ -1134,6 +1135,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_cached=batch.encoder_cached,
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
+            lora_start_lens=[
+                (req.sampling_params.custom_params or {}).get("lora_start_len", 0)
+                for req in batch.reqs
+            ],
             rids=[req.rid for req in batch.reqs],
             watermark_prompt_tail_ids=(
                 watermark_state.prompt_tails(batch)
