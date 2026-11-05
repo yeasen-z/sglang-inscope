@@ -28,6 +28,15 @@ from sglang.srt.feature_capture.spec import SCHEMA_VERSION, FeatureRequestSpec
 def build_feature_records(
     *, spec: FeatureRequestSpec, values: dict[tuple[int, int], torch.Tensor]
 ) -> list[dict]:
+    from .dense_store import DenseFeatureStore
+    if isinstance(values, DenseFeatureStore):
+        if not values.complete:
+            return []
+        return [{"schema_version": SCHEMA_VERSION, "layer": target.layer, "site": target.site,
+                 "positions": list(spec.positions), "dtype": str(values.buffers[target.layer].dtype).removeprefix("torch."),
+                 "shape": list(values.buffers[target.layer].shape), "encoding": spec.encoding,
+                 "data": _encode_tensor(tensor=values.buffers[target.layer], encoding=spec.encoding)}
+                for target in spec.targets]
     records = []
     for target in spec.targets:
         positions = [
@@ -57,6 +66,8 @@ def _encode_tensor(*, tensor: torch.Tensor, encoding: str):
     tensor = tensor.detach().contiguous().cpu()
     if encoding == "float_list":
         return tensor.float().tolist()
+    if encoding == "raw_bytes":
+        return tensor.view(torch.uint8).numpy().tobytes()
     if encoding == "base64":
         raw = tensor.view(torch.uint8).numpy().tobytes()
         return base64.b64encode(raw).decode("ascii")

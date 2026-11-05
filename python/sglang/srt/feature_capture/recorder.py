@@ -24,6 +24,9 @@ from sglang.srt.feature_capture.plan import SlotPlan
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 
 
+OUTPUT_FACTORY_API_VERSION = 1
+
+
 class FeatureCaptureRecorder:
     """Invocation-scoped recorder populated at model layer boundaries."""
 
@@ -85,6 +88,16 @@ class FeatureDeviceOutput:
     def copy_to_host(
         self, copy_tensor: Callable[[torch.Tensor], torch.Tensor]
     ) -> FeatureHostOutput:
+        # Explicit operator plugin for local GPU-resident detection. The default
+        # transport and all existing request encodings remain unchanged.
+        import os
+        factory = os.environ.get("SGLANG_FEATURE_OUTPUT_FACTORY")
+        if factory:
+            from importlib import import_module
+            module, separator, name = factory.partition(":")
+            if not separator or not module or not name:
+                raise ValueError("SGLANG_FEATURE_OUTPUT_FACTORY must be module:function")
+            return getattr(import_module(module), name)(self, copy_tensor)
         return FeatureHostOutput(tensor=copy_tensor(self.tensor), plan=self.plan)
 
 
@@ -99,6 +112,14 @@ class FeatureHostOutput:
             row = slot.out_start
             for rid, positions in slot.segments:
                 req = requests[rid]
+                if req.feature_capture is not None and req.feature_capture.encoding == "raw_bytes":
+                    from .dense_store import DenseFeatureStore
+                    if not req.is_retracted:
+                        if not isinstance(req.feature_capture_values, DenseFeatureStore):
+                            req.feature_capture_values = DenseFeatureStore(req.feature_capture)
+                        req.feature_capture_values.add(slot.layer, positions, self.tensor[row:row+len(positions)])
+                    row += len(positions)
+                    continue
                 for position in positions:
                     if not req.is_retracted:
                         key = (slot.layer, position)
@@ -108,6 +129,12 @@ class FeatureHostOutput:
         for req in batch.reqs:
             if req.is_retracted or req.feature_capture is None:
                 continue
+            if req.feature_capture.encoding == "raw_bytes":
+                from .dense_store import DenseFeatureStore
+                if not isinstance(req.feature_capture_values, DenseFeatureStore) or not req.feature_capture_values.complete:
+                    continue
+                if req.customized_info and "features" in req.customized_info:
+                    continue
             if req.customized_info is None:
                 req.customized_info = {}
             req.customized_info["features"] = build_feature_records(

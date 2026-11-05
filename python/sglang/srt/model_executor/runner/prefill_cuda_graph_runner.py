@@ -41,6 +41,8 @@ import copy
 import dataclasses
 import inspect
 import logging
+import os
+from collections import deque
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -2395,6 +2397,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
         self._validate_capture_hidden_mode(forward_batch)
+        diagnostic_start = None
+        if os.environ.get("FYH_FEATURE_PREFILL_DIAGNOSTICS") == "1":
+            if not hasattr(self, "_feature_prefill_timings"):
+                self._feature_prefill_timings = deque()
+            pending = self._feature_prefill_timings
+            while pending and pending[0][1].query():
+                start, end, actual, padded = pending.popleft()
+                logger.info(
+                    "Feature prefill graph: actual_tokens=%d padded_tokens=%d "
+                    "padding_fraction=%.6f gpu_span_ms=%.3f",
+                    actual, padded, (padded - actual) / max(padded, 1),
+                    start.elapsed_time(end),
+                )
+            # Bound event retention without introducing a GPU synchronization.
+            if len(pending) < 64:
+                diagnostic_start = torch.cuda.Event(enable_timing=True)
+                diagnostic_start.record()
         with self.model_context(), self.backend.replay_session():
             static_forward_batch, shared_read_ends = self.load_batch(
                 forward_batch, **kwargs
@@ -2446,4 +2465,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     raw_num_tokens,
                     **kwargs,
                 )
-            return self._finalize_execute_output(output)
+            result = self._finalize_execute_output(output)
+            if diagnostic_start is not None:
+                diagnostic_end = torch.cuda.Event(enable_timing=True)
+                diagnostic_end.record()
+                self._feature_prefill_timings.append(
+                    (diagnostic_start, diagnostic_end, raw_num_tokens, static_num_tokens)
+                )
+            return result

@@ -40,7 +40,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 SCHEMA_VERSION = "inscope.feature_capture.v1"
 
 SUPPORTED_SITES: Tuple[str, ...] = ("block_output",)
-SUPPORTED_ENCODINGS: Tuple[str, ...] = ("base64", "float_list")
+SUPPORTED_ENCODINGS: Tuple[str, ...] = ("base64", "float_list", "raw_bytes")
 POSITION_MODES: Tuple[str, ...] = ("last", "explicit", "suffix_last", "all")
 
 # Conservative FP32 byte estimate, matching the sibling capture runtimes.
@@ -228,6 +228,8 @@ def validate(
         resolved_layers.append(resolved)
 
     encoding = raw.get("encoding", "base64")
+    if encoding == "raw_bytes" and os.environ.get("SGLANG_FEATURE_CAPTURE_RAW_BYTES") != "1":
+        raise FeatureCaptureError("raw_bytes is restricted to opt-in local Engine services")
     if encoding not in SUPPORTED_ENCODINGS:
         raise FeatureCaptureError(
             f"encoding must be one of {', '.join(SUPPORTED_ENCODINGS)}"
